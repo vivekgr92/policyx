@@ -37,15 +37,21 @@ POLICY_DEPS = {
         # flash-attn compiles from source and can take 10-20 minutes
         "slow_install_packages": ["flash-attn"],
     },
+    # pi0/pi0_fast/pi05 are PaliGemma-based and need the patched transformers fork
+    # (see needs_transformers_pi_patch handling in check_dependencies below) instead of
+    # a plain PyPI transformers install, so they deliberately have no generic
+    # "transformers" entry in "required" here — the patch check subsumes it.
     "pi05": {
-        "required": [
-            ("transformers", "transformers>=4.57.1,<5.0.0"),
-        ],
+        "required": [],
+        "needs_transformers_pi_patch": True,
     },
     "pi0": {
-        "required": [
-            ("transformers", "transformers>=4.57.1,<5.0.0"),
-        ],
+        "required": [],
+        "needs_transformers_pi_patch": True,
+    },
+    "pi0_fast": {
+        "required": [],
+        "needs_transformers_pi_patch": True,
     },
     "smolvla": {
         "required": [
@@ -131,6 +137,31 @@ def read_policy_type(policy_path: str) -> str | None:
     return None
 
 
+def _has_transformers_pi_patch() -> bool:
+    """Check whether the patched transformers fork required by pi0/pi0_fast/pi05 is installed.
+
+    lerobot's PaliGemma-based policies (pi0, pi0_fast, pi05) need transformers built from
+    huggingface/transformers@fix/lerobot_openpi, which vendors a patched
+    transformers.models.siglip.check module. A plain PyPI transformers install satisfies
+    the generic version pin but is missing this module, so the policy fails at model-build
+    time with a cryptic "An incorrect transformer version is used" ValueError deep inside
+    lerobot rather than at preflight time.
+    """
+    try:
+        from transformers.models.siglip import check
+
+        return bool(check.check_whether_transformers_replace_is_installed_correctly())
+    except Exception:
+        return False
+
+
+# pip spec matching lerobot's own `pi` extra (see lerobot's pyproject.toml,
+# Requires-Dist for extra == "pi") rather than a generic PyPI transformers pin.
+TRANSFORMERS_PI_PATCH_SPEC = (
+    "transformers @ git+https://github.com/huggingface/transformers.git@fix/lerobot_openpi"
+)
+
+
 def check_dependencies(policy_type: str) -> tuple[list[str], list[str]]:
     """Check if required packages for a policy type are installed.
 
@@ -143,6 +174,9 @@ def check_dependencies(policy_type: str) -> tuple[list[str], list[str]]:
     for import_name, pip_spec in deps.get("required", []):
         if not importlib.util.find_spec(import_name):
             missing_required.append(pip_spec)
+
+    if deps.get("needs_transformers_pi_patch") and not _has_transformers_pi_patch():
+        missing_required.append(TRANSFORMERS_PI_PATCH_SPEC)
 
     for entry in deps.get("optional", []):
         import_name, pip_spec = entry[0], entry[1]
@@ -268,6 +302,7 @@ def run_preflight_check(policy_path: str) -> bool:
         typer.echo(f"   Optional (not installed): {', '.join(names)}")
 
     # Warn about slow-installing packages (e.g., flash-attn compiles from source)
+    deps = POLICY_DEPS.get(policy_type, {})
     slow_packages = deps.get("slow_install_packages", [])
     all_missing_names = [spec.split(">=")[0].split("==")[0] for spec in missing_required + missing_optional]
     slow_missing = [pkg for pkg in slow_packages if pkg in all_missing_names]

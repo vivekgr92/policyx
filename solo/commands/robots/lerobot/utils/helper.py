@@ -18,6 +18,7 @@ ROBOT_TYPE_MENU = {
     4: ("Bimanual SO100", "bi_so100"),
     5: ("Bimanual SO101", "bi_so101"),
     6: ("RealMan R1D2 - SO101 leader", "realman_r1d2"),
+    7: ("Star Arm 102 leader - SO101 follower", "stararm102"),
 }
 
 
@@ -116,9 +117,20 @@ def port_detection(config: dict, arm_type: str, robot_type: str, current_port: O
     Returns:
         Detected or existing port string, or None if detection failed
     """
+    from solo.commands.robots.lerobot.config import is_starai_robot
+
+    if arm_type == "leader" and is_starai_robot(robot_type):
+        # A saved leader port may belong to a different leader entirely, and the
+        # FashionStar driver fails obscurely on the wrong port, so verify it.
+        from solo.commands.robots.lerobot.starai_config import resolve_starai_leader_port
+        resolved = resolve_starai_leader_port(current_port)
+        if resolved:
+            config[f'{arm_type}_port'] = resolved
+        return resolved
+
     if current_port:
         return current_port
-    
+
     from solo.commands.robots.lerobot.ports import detect_arm_port
     
     detected_port, _ = detect_arm_port(arm_type, robot_type=robot_type)
@@ -150,8 +162,14 @@ def prompt_arm_id(config: dict, arm_type: str, robot_type: str, current_id: Opti
     known_leader_ids, known_follower_ids = get_known_ids(config, robot_type=robot_type)
     known_ids = known_leader_ids if arm_type == "leader" else known_follower_ids
     
-    # Get default ID from config or generate one
-    default_id = config.get('lerobot', {}).get(f'{arm_type}_id') or f"{robot_type}_{arm_type}"
+    # Get default ID from config or generate one. Only reuse the saved id when it
+    # was recorded for this robot type — otherwise switching arms silently offers
+    # the other arm's id, which points calibration at the wrong file.
+    lerobot_config = config.get('lerobot', {})
+    saved_id = lerobot_config.get(f'{arm_type}_id')
+    if saved_id and lerobot_config.get('robot_type') not in (None, robot_type):
+        saved_id = None
+    default_id = saved_id or f"{robot_type}_{arm_type}"
     
     # Display known IDs
     display_known_ids(known_ids, arm_type, detected_robot_type=robot_type, config=config)

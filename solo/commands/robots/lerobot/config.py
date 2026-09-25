@@ -104,6 +104,8 @@ def infer_robot_type_from_id(arm_id: str) -> Optional[str]:
         return 'so100'
     elif 'realman' in arm_id_lower or 'r1d2' in arm_id_lower:
         return 'realman'
+    elif 'stararm102' in arm_id_lower or 'star' in arm_id_lower:
+        return 'stararm102'
     elif 'bi_so100' in arm_id_lower or 'biso100' in arm_id_lower:
         return 'bi_so100'
     elif 'bi_so101' in arm_id_lower or 'biso101' in arm_id_lower:
@@ -337,6 +339,14 @@ def get_robot_config_classes(robot_type: str) -> Tuple[Optional[type], Optional[
         from lerobot.teleoperators.bi_so_leader import BiSO101LeaderConfig
         from lerobot.robots.bi_so_follower import BiSO101FollowerConfig
         return BiSO101LeaderConfig, BiSO101FollowerConfig
+    elif robot_type == "stararm102":
+        # Star Arm 102 leader (FashionStar UART bus) driving an SO101 follower.
+        # The leader speaks a different protocol and has one joint more than the
+        # SO101, so it goes through Solo's remapping adapter rather than a stock
+        # LeRobot teleoperator.
+        from solo.commands.robots.lerobot.teleoperators import StarArm102SO101LeaderConfig
+        from lerobot.robots.so_follower import SO101FollowerConfig
+        return StarArm102SO101LeaderConfig, SO101FollowerConfig
     elif robot_type in ["realman_r1d2", "realman_rm65", "realman_rm75"]:
         # RealMan robots use SO101 as leader arm (USB serial)
         # and RealMan arm as follower (network connection)
@@ -360,6 +370,17 @@ def is_realman_robot(robot_type: str) -> bool:
     They use SO101 as the leader arm for teleoperation.
     """
     return robot_type in ["realman_r1d2", "realman_rm65", "realman_rm75"]
+
+
+def is_starai_robot(robot_type: str) -> bool:
+    """
+    Check if robot type uses a Star Arm 102 (StarAI / Fashionstar) leader arm.
+
+    These pair a FashionStar-bus leader with a standard SO101 follower, so the
+    leader action has to be remapped onto SO101 joint names before it is sent.
+    """
+    from solo.commands.robots.lerobot.starai_config import is_starai_robot as _is_starai
+    return _is_starai(robot_type)
 
 
 def get_realman_model_from_type(robot_type: str) -> str:
@@ -453,15 +474,50 @@ def create_follower_config(
     Create follower configuration with optional camera support (single-arm robots)
     """
     cameras_dict = build_camera_configuration(camera_config or {})
-    
+
+    kwargs = {
+        'port': follower_port,
+        'id': follower_id or f"{robot_type}_follower",
+    }
     if cameras_dict:
-        return follower_config_class(
-            port=follower_port,
-            id=follower_id or f"{robot_type}_follower",
-            cameras=cameras_dict
+        kwargs['cameras'] = cameras_dict
+
+    if is_starai_robot(robot_type):
+        # The Star Arm 102 leader is not the SO101's twin, so a mis-signed or
+        # badly scaled joint would otherwise command a large jump. Capping the
+        # per-step move keeps a mapping mistake to a slow drift the operator can
+        # stop, at the cost of one extra follower read per control step.
+        from solo.commands.robots.lerobot.starai_config import starai_max_relative_target
+        max_relative_target = starai_max_relative_target()
+        if max_relative_target is not None:
+            kwargs['max_relative_target'] = max_relative_target
+
+    return follower_config_class(**kwargs)
+
+
+def create_leader_config(
+    leader_config_class,
+    leader_port: str,
+    robot_type: str,
+    leader_id: Optional[str] = None,
+    follower_id: Optional[str] = None,
+):
+    """
+    Create leader configuration for single-arm robots.
+
+    Star Arm 102 leaders carry the saved joint mapping (and the follower's travel
+    limits, when the follower id is known); every other leader just needs a port
+    and an id.
+    """
+    if is_starai_robot(robot_type):
+        from solo.commands.robots.lerobot.starai_config import create_starai_leader_config
+        return create_starai_leader_config(
+            port=leader_port,
+            leader_id=leader_id or f"{robot_type}_leader",
+            follower_id=follower_id,
         )
-    else:
-        return follower_config_class(port=follower_port, id=follower_id or f"{robot_type}_follower")
+
+    return leader_config_class(port=leader_port, id=leader_id or f"{robot_type}_leader")
 
 
 def create_bimanual_leader_config(
@@ -520,7 +576,13 @@ def create_robot_configs(
         typer.echo(f"❌ Unsupported robot type: {robot_type}")
         return None, None
     
-    leader_config = leader_config_class(port=leader_port, id=leader_id or f"{robot_type}_leader")
+    leader_config = create_leader_config(
+        leader_config_class,
+        leader_port,
+        robot_type,
+        leader_id=leader_id,
+        follower_id=follower_id,
+    )
     follower_config = create_follower_config(
         follower_config_class,
         follower_port,

@@ -170,6 +170,9 @@ solo robo --inference
 # Replay a recorded action/episode
 solo robo --replay
 
+# Tune the Star Arm 102 (StarAI) leader -> SO101 follower joint mapping
+solo robo --star-tune
+
 # Use -y or --yes to auto-use saved settings (skip prompts)
 solo robo --teleop -y
 solo robo --record --yes

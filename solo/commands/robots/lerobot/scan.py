@@ -59,6 +59,66 @@ KOCH_LEADER_MODELS = {1190}  # XL330-M077 only
 KOCH_FOLLOWER_MODELS = {1060, 1200, 1020, 1120, 1070}  # XL430, XL330-M288, etc.
 
 
+# Star Arm 102 / StarAI leader: FashionStar UART servo bus, ids 0-5 + gripper on 6.
+# The bus runs at 1 Mbaud through a UC-01 board that enumerates as a CH340.
+STARAI_BAUDRATE = 1_000_000
+STARAI_SERVO_IDS = range(0, 7)
+STARAI_REQUEST_HEADER = b"\x12\x4c"
+STARAI_RESPONSE_HEADER = b"\x05\x1c"
+STARAI_PING_CMD = 0x01
+
+
+def scan_starai_port(port: str, baudrate: int = STARAI_BAUDRATE, verbose: bool = False,
+                     timeout: float = PORT_SCAN_TIMEOUT) -> dict[int, int]:
+    """
+    Scan a port for FashionStar servos (Star Arm 102 / StarAI arms).
+
+    Speaks the FashionStar UART protocol directly rather than through
+    `fashionstar-uart-sdk`, so `solo robo --scan` still reports these arms on a
+    machine where the vendor LeRobot plugin has not been installed yet.
+
+    Returns {servo_id: servo_id} for every servo that answered; FashionStar ping
+    replies carry no model number, so the value is just the id.
+    """
+
+    def _scan():
+        try:
+            import serial
+        except ImportError:
+            if verbose:
+                typer.echo("   ⚠️  pyserial not installed")
+            return {}
+
+        found = {}
+        try:
+            with serial.Serial(port, baudrate, timeout=0.05) as conn:
+                for servo_id in STARAI_SERVO_IDS:
+                    body = STARAI_REQUEST_HEADER + bytes([STARAI_PING_CMD, 0x01, servo_id])
+                    conn.reset_input_buffer()
+                    conn.write(body + bytes([sum(body) & 0xFF]))
+
+                    reply = conn.read(6)
+                    if (
+                        len(reply) == 6
+                        and reply.startswith(STARAI_RESPONSE_HEADER)
+                        and reply[4] == servo_id
+                        and reply[5] == sum(reply[:5]) & 0xFF
+                    ):
+                        found[servo_id] = servo_id
+        except Exception as e:
+            if verbose:
+                typer.echo(f"   ⚠️  StarAI scan error on {port}: {e}")
+
+        return found
+
+    result = run_with_timeout(_scan, timeout, default={})
+    if result is None:
+        if verbose:
+            typer.echo(f"   ⚠️  StarAI scan on {port} timed out after {timeout}s")
+        return {}
+    return result
+
+
 def get_serial_ports() -> list[str]:
     """Get available serial ports for motor scanning."""
     ports = []
@@ -353,13 +413,22 @@ def detect_robot_type_from_port(port: str, verbose: bool = False) -> tuple[Optio
     Auto-detect robot type and motor brand by scanning a port.
     
     Returns (robot_type, motor_brand, motors_found) where:
-        - robot_type: "koch", "so100", "so101", or None
-        - motor_brand: "dynamixel", "feetech", or None
+        - robot_type: "koch", "so100", "so101", "stararm102", or None
+        - motor_brand: "dynamixel", "feetech", "starai", or None
         - motors_found: {motor_id: model_number}
     """
     if verbose:
         typer.echo(f"   Scanning {port} for motors...")
-    
+
+    # Try StarAI first: it is a single short exchange per servo, so it costs far
+    # less than the Dynamixel/Feetech id sweeps, and its frame header is ignored
+    # by both of those buses.
+    starai_motors = scan_starai_port(port)
+    if starai_motors:
+        if verbose:
+            typer.echo(f"   ✅ Found {len(starai_motors)} FashionStar servos (Star Arm 102)")
+        return "stararm102", "starai", starai_motors
+
     # Try Dynamixel first
     dynamixel_motors = scan_dynamixel_port(port)
     if dynamixel_motors:
@@ -418,6 +487,15 @@ def auto_detect_robot_type(verbose: bool = True) -> tuple[Optional[str], list[tu
             if robot_type:
                 detected_types.add(robot_type)
     
+    # A StarAI arm has only one role in Solo - the Star Arm 102 leader driving an
+    # SO101 follower - so its presence settles the robot type even when an SO101
+    # leader happens to be plugged in alongside it.
+    if "stararm102" in detected_types and len(detected_types) > 1:
+        if verbose:
+            others = sorted(detected_types - {"stararm102"})
+            typer.echo(f"✅ Detected robot type: STARARM102 (also saw: {', '.join(others)})")
+        return "stararm102", port_info
+
     # Determine final robot type
     if len(detected_types) == 1:
         robot_type = detected_types.pop()
@@ -466,11 +544,22 @@ def auto_detect_ports(robot_type: str = None, verbose: bool = True) -> tuple[Opt
         if motors:
             ports_with_motors.append((port, port_robot_type, motor_brand, motors))
             
-            # Update detected robot type if not specified
-            if detected_robot_type is None and port_robot_type:
+            # Update detected robot type if not specified. A StarAI arm overrides an
+            # earlier guess for the same reason as in auto_detect_robot_type().
+            if port_robot_type == "stararm102" and robot_type is None:
+                detected_robot_type = port_robot_type
+            elif detected_robot_type is None and port_robot_type:
                 detected_robot_type = port_robot_type
             
-            if motor_brand == "dynamixel":
+            if motor_brand == "starai":
+                # The Star Arm 102 is only sold and supported here as a leader.
+                port_info.append((port, motors, "leader", motor_brand))
+                # Claim the leader slot only when we are actually looking for a
+                # Star Arm 102, so an explicit --robot-type of so101 is not handed
+                # a port its Feetech driver cannot talk to.
+                if robot_type in (None, "stararm102"):
+                    leader_port = port
+            elif motor_brand == "dynamixel":
                 # Koch arms - can distinguish leader/follower by motor model
                 models = set(motors.values())
                 arm_type = detect_arm_type_from_models(models, "dynamixel")
@@ -571,6 +660,12 @@ def scan_motors():
         sdk_status.append("✅ scservo_sdk installed")
     except ImportError:
         sdk_status.append("❌ scservo_sdk NOT installed")
+
+    try:
+        import lerobot_teleoperator_stararm102  # noqa: F401
+        sdk_status.append("✅ lerobot_teleoperator_stararm102 installed (Star Arm 102)")
+    except ImportError:
+        sdk_status.append("⚪ lerobot_teleoperator_stararm102 not installed (needed only for Star Arm 102)")
     
     typer.echo("📦 SDK Status:")
     for status in sdk_status:
@@ -599,9 +694,29 @@ def scan_motors():
     for port in ports:
         typer.echo(f"━━━ {port} ━━━")
         
-        # Try Dynamixel first (Koch arms)
+        # Try StarAI first (Star Arm 102 / StarAI arms) - cheapest probe
+        starai_motors = scan_starai_port(port, verbose=True)
+
+        if starai_motors:
+            found_any = True
+            detected_robot_type = "stararm102"
+            typer.echo("  FashionStar servos (Star Arm 102 / StarAI bus):")
+            for servo_id in sorted(starai_motors):
+                role = "gripper" if servo_id == 6 else f"joint {servo_id + 1}"
+                typer.echo(f"    ✅ ID {servo_id}: {role}")
+            if len(starai_motors) == 7:
+                typer.echo("    → Star Arm 102 LEADER arm (6 joints + gripper)")
+            else:
+                typer.echo(
+                    f"    ⚠️  Only {len(starai_motors)}/7 servos answered — check the"
+                    " daisy chain and 12V supply"
+                )
+            typer.echo("")
+            continue
+
+        # Try Dynamixel next (Koch arms)
         dynamixel_motors = scan_dynamixel_port(port, verbose=True)
-        
+
         if dynamixel_motors:
             found_any = True
             detected_robot_type = "koch"
@@ -663,6 +778,7 @@ def scan_motors():
         typer.echo("   1. Make sure the arm is POWERED")
         typer.echo("      • Dynamixel/Koch: 12V power supply")
         typer.echo("      • Feetech/SO100/SO101: 7.4V or 12V depending on model")
+        typer.echo("      • Star Arm 102 / StarAI: 12V into the UC-01 board")
         typer.echo("   2. Check that motor cables are firmly connected")
         if sys.platform == "win32":
             typer.echo("   3. Windows-specific checks:")
@@ -697,14 +813,31 @@ def diagnose_connection(port: str, verbose: bool = True) -> dict:
         "errors": []
     }
     
+    if verbose:
+        typer.echo(f"\n🔍 Diagnosing connection on {port}...")
+
+    # A Star Arm 102 speaks neither Dynamixel nor Feetech, so check for it first —
+    # otherwise the checks below would report "no motors" on a healthy arm.
+    starai_motors = scan_starai_port(port, verbose=verbose)
+    if starai_motors:
+        results["motors_found"] = starai_motors
+        results["ping_success"] = True
+        results["arm_type"] = "leader"
+        results["motor_brand"] = "starai"
+        if verbose:
+            typer.echo(
+                f"  ✅ {len(starai_motors)}/7 FashionStar servos answered "
+                f"(Star Arm 102 leader): {sorted(starai_motors)}"
+            )
+            if len(starai_motors) < 7:
+                typer.echo("  ⚠️  Missing servos — check the daisy chain and 12V supply")
+        return results
+
     try:
         import dynamixel_sdk as dxl
     except ImportError:
         results["errors"].append("dynamixel_sdk not installed")
         return results
-    
-    if verbose:
-        typer.echo(f"\n🔍 Diagnosing connection on {port}...")
     
     try:
         port_handler = dxl.PortHandler(port)

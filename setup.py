@@ -29,10 +29,18 @@ setup(
         "lerobot[feetech,dynamixel] @ git+https://github.com/GetSoloTech/solo-bot.git@main",
         "transformers",
         "accelerate",
-        "num2words"
+        "num2words",
+        "websockets",
     ],
     extras_require={
         "dev": ["pytest", "black", "isort"],
+        # Star Arm 102 / StarAI leader arms speak the FashionStar UART protocol,
+        # which neither the Feetech nor the Dynamixel driver can talk to.
+        "starai": [
+            "lerobot_teleoperator_stararm102",
+            "lerobot-motor-starai",
+            "fashionstar-uart-sdk>=1.3.6",
+        ],
     },
     python_requires=">=3.8",
     entry_points={

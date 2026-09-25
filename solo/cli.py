@@ -24,12 +24,54 @@ def robo(
     replay: bool = typer.Option(False, "--replay", help="Replay actions from a recorded dataset episode"),
     scan: bool = typer.Option(False, "--scan", help="Scan for connected motors on all serial ports"),
     diagnose: bool = typer.Option(False, "--diagnose", help="Run detailed connection diagnostics on all ports"),
+    star_tune: bool = typer.Option(False, "--star-tune", help="Tune the Star Arm 102 leader -> SO101 follower joint mapping"),
+    deployx_run: Optional[str] = typer.Option(
+        None,
+        "--deployx-run",
+        help="Run the DeployX edge agent against a policy server, e.g. ws://<pod-host>:8849",
+    ),
+    deployx_serve: Optional[str] = typer.Option(
+        None,
+        "--deployx-serve",
+        help="Start the DeployX policy server for the given checkpoint (local path, 'org/model' HF repo id, or 'solo:org/model')",
+    ),
+    deployx_port: Optional[int] = typer.Option(
+        None,
+        "--deployx-port",
+        help="Port for the DeployX policy server (default: protocol.DEFAULT_PORT)",
+    ),
     yes: bool = typer.Option(False, "--yes", "-y", help="Automatically use saved settings if available"),
     # Replay-specific options (non-interactive)
     dataset: Optional[str] = typer.Option(None, "--dataset", help="Dataset repository ID for replay (e.g., 'organize_fennel_seed')"),
-    episode: Optional[int] = typer.Option(None, "--episode", help="Episode number to replay (default: 0)"),
+    episode: Optional[str] = typer.Option(
+        None,
+        "--episode",
+        help="Episode(s) to replay: a number ('3'), a comma list ('0,2,5'), a range ('0-10'), a combination ('0-2,5,7-9'), or 'all' (default: 0)",
+    ),
     follower_id: Optional[str] = typer.Option(None, "--follower-id", help="Follower arm ID for replay (e.g., 'follower_right')"),
     fps: Optional[int] = typer.Option(None, "--fps", help="Frames per second for replay (default: 30)"),
+    save_replay_as: Optional[str] = typer.Option(
+        None,
+        "--save-replay-as",
+        help="Also record the replayed run(s) as new episode(s) in this dataset repo id (requires cameras)",
+    ),
+    repeat: Optional[int] = typer.Option(
+        None,
+        "--repeat",
+        help="How many times to replay each selected episode (default: 1)",
+    ),
+    perturb: Optional[float] = typer.Option(
+        None,
+        "--perturb",
+        help="Perturb replayed actions by this fraction of each joint's safe range, "
+        "for motion diversity (default: 0, disabled). Safety-validated/clamped like a live policy's output.",
+    ),
+    perturb_increment: Optional[float] = typer.Option(
+        None,
+        "--perturb-increment",
+        help="Increase --perturb by this amount on each successive repeat (default: 0, constant). "
+        "E.g. --perturb 0.02 --repeat 2 --perturb-increment 0.01 -> repeat 1 uses 0.02, repeat 2 uses 0.03.",
+    ),
 ):
     """
     Robotics operations: motor setup, calibration, teleoperation, data recording, training, replay, and inference
@@ -42,8 +84,25 @@ def robo(
         from solo.commands.robots.lerobot.scan import diagnose_all_ports
         diagnose_all_ports()
         return
+    if star_tune:
+        import json, os
+        from solo.config import CONFIG_PATH
+        from solo.commands.robots.lerobot.starai_tune import tune_starai_map
+        saved_config = {}
+        if os.path.exists(CONFIG_PATH):
+            try:
+                with open(CONFIG_PATH) as f:
+                    saved_config = json.load(f)
+            except (json.JSONDecodeError, OSError):
+                saved_config = {}
+        tune_starai_map(saved_config)
+        return
+    if deployx_serve is not None:
+        from solo.commands.robots.lerobot.deployx.policy_server import run_policy_server
+        run_policy_server(deployx_serve, port=deployx_port)
+        return
     from solo.commands.robo import robo as _robo
-    _robo(motors, calibrate, teleop, record, train, inference, replay, yes, dataset, episode, follower_id, fps)
+    _robo(motors, calibrate, teleop, record, train, inference, replay, yes, dataset, episode, follower_id, fps, deployx_run, save_replay_as, repeat, perturb, perturb_increment)
 
 
 @app.command()

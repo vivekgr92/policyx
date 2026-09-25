@@ -9,20 +9,24 @@ from rich.console import Console
 
 console = Console()
 
-def handle_lerobot(config: dict, calibrate: str, motors: str, teleop: bool, record: bool, train: bool, inference: bool = False, replay: bool = False, auto_use: bool = False, replay_options: dict = None):
+def handle_lerobot(config: dict, calibrate: str, motors: str, teleop: bool, record: bool, train: bool, inference: bool = False, replay: bool = False, auto_use: bool = False, replay_options: dict = None, deployx_run: str = None):
     """Handle LeRobot framework operations"""
     # Import lerobot for operations that need it immediately at top level
     # Calibration and motor setup do lazy imports with loading spinners
-    needs_lerobot = train or record or inference or replay or teleop
-    
+    needs_lerobot = train or record or inference or replay or teleop or bool(deployx_run)
+
     if needs_lerobot:
         try:
             import lerobot  # Heavy import - only when needed
         except ImportError:
             typer.echo("❌ LeRobot is not installed.")
             return
-    
-    if train:
+
+    if deployx_run:
+        # DeployX edge agent mode - stream observations to a remote policy server
+        from solo.commands.robots.lerobot.deployx.edge_agent import deployx_run_mode
+        deployx_run_mode(config, deployx_run, auto_use)
+    elif train:
         # Training mode - train a policy on recorded data
         from solo.commands.robots.lerobot.modes import training_mode
         training_mode(config, auto_use)

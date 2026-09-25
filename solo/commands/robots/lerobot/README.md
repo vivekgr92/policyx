@@ -57,8 +57,108 @@ Solo CLI supports multiple robot configurations:
 - **Koch**: Single-arm setups using Dynamixel motors
 - **Bimanual**: Dual-arm configurations (left + right)
 - **RealMan**: Network-connected industrial robots (SO101 leader + RealMan follower)
+- **Star Arm 102**: StarAI / Fashionstar leader driving an SO101 follower (see below)
 
 The robot type is auto-detected when you connect your arms, or you can manually select it during setup.
+
+### Star Arm 102 (StarAI / Fashionstar) leader
+
+The Star Arm 102 `LD` leader talks over the FashionStar UART bus rather than the
+Feetech or Dynamixel protocols, and has 6 joints plus a gripper where the SO101
+has 5 plus a gripper. Solo pairs it with a standard SO101 follower and remaps the
+leader's joints onto SO101 joint names on the way through.
+
+**One-time setup**
+
+```bash
+# The vendor LeRobot plugin for the arm (not installed by default)
+pip install 'solo-cli[starai]'
+
+# Confirm the arm is seen - 7 FashionStar servos, ids 0-6
+solo robo --scan
+
+# Calibrate the leader, then the SO101 follower
+solo robo --calibrate leader
+solo robo --calibrate follower
+```
+
+Calibration matters more here than in a like-for-like pairing: each joint angle
+is measured from the midpoint of the range you record, so sweep every joint
+through its full travel on both arms.
+
+There is no `--motors` step for the Star Arm 102 - its servos ship with fixed bus
+ids.
+
+**Joint mapping**
+
+| SO101 joint     | Star Arm 102 servo |
+|-----------------|--------------------|
+| `shoulder_pan`  | `Motor_0`          |
+| `shoulder_lift` | `Motor_1`          |
+| `elbow_flex`    | `Motor_2`          |
+| `wrist_flex`    | `Motor_4`          |
+| `wrist_roll`    | `Motor_5`          |
+| `gripper`       | `gripper`          |
+
+`Motor_3` is the leader's forearm roll. The SO101 has no forearm roll - only a
+wrist roll - so by default that joint drives nothing. Since the leader has 6 body
+joints and the follower 5, one axis has to go somewhere; see **Blending** below
+for the alternative.
+
+**Tuning**
+
+Expect at least one axis to run backwards on first use - the two arms are
+different hardware. Fix it without editing anything by hand:
+
+```bash
+solo robo --star-tune
+```
+
+| Option | What it does |
+|--------|--------------|
+| 1 | **Identify leader joints** - move one joint at a time; the row that lights up names that servo and says what it drives (or that it is the spare) |
+| 2 | **Live mapping view** - each leader reading beside the follower command it produces, and whether it is hitting a limit |
+| 3-5 | Flip a joint's direction, set its gain, set its offset |
+| 6 | Reassign which leader servo drives a joint |
+| 7 | Blend an extra leader servo into a joint |
+| 8-9 | Per-step motion cap, smoothing |
+| a | Auto-fit gains to the follower's travel |
+
+Everything is saved to `~/.solo/starai_map.json` and picked up by teleop, record
+and inference alike.
+
+**Blending the spare joint**
+
+Option 7 folds an extra leader servo into a follower joint, so the Star Arm's two
+twist axes can both drive the SO101's single wrist roll:
+
+```
+wrist_roll ← Motor_5 +1.00×Motor_3
+```
+
+Weights are leader degrees per follower degree. Use `-1.0` when the two axes turn
+opposite ways - with `+1.0` on opposed axes they cancel and the joint goes dead.
+Set a weight of `0` to remove a blend. The gripper cannot be blended; it is a
+single 0-100 axis.
+
+**Matching the travel**
+
+The arms are not the same size, so a 1:1 degree transfer leaves the follower
+pinned at a limit wherever the leader swings further, and short of its reach
+wherever it swings less. Option `a` compares the two calibrations and scales each
+gain so the leader's recorded sweep covers the follower's travel.
+
+If it suggests a gain above ~2, that joint was probably not swept fully during
+leader calibration - recalibrate rather than accept the gain, because a large
+gain magnifies hand tremor as well as motion.
+
+**Safety**
+
+The follower runs with `max_relative_target` set (12° per control step by
+default), so a wrong sign shows up as a slow drift you can stop rather than a
+lunge. Commands are also clamped to the follower's own calibrated travel, which
+needs the follower id to have been calibrated under the name you select. Raise,
+lower or disable the cap from `solo robo --star-tune` once the mapping is right.
 
 ---
 
@@ -249,7 +349,7 @@ solo robo --motors follower
 ```
 
 ### Interactive flow
-- Select or reuse the **robot type** (`SO100`, `SO101`, `Koch`, or bimanual variants).
+- Select or reuse the **robot type** (`SO100`, `SO101`, `Koch`, or bimanual variants). Star Arm 102 leaders are skipped here - their servo ids are fixed at the factory.
 - Auto-detect the **leader** and/or **follower** port(s); unplug/replug guidance is provided if needed.
 - For each selected arm, the tool launches LeRobot's device and runs `setup_motors()`.
 
@@ -293,6 +393,7 @@ solo robo --diagnose
 
 ### What it does
 - Opens each serial port and sets baud rate.
+- Reports a Star Arm 102 leader (FashionStar bus) and stops there, since the checks below do not apply to it.
 - Pings motors 1-6 and reports which respond.
 - Reads Min_Position_Limit register to verify read operations work.
 - Reads Present_Position register for each motor.
@@ -308,7 +409,7 @@ solo robo --diagnose
 ## Cameras and Ports
 
 - **Ports**: Auto-detection works on Windows, macOS, and Linux. If `pyserial` is missing, it is installed automatically. If the arm was already connected, you'll be guided to unplug/replug to identify the correct port.
-- **Arm Type Detection**: For SO100/SO101 arms, leader vs follower is detected by motor voltage (5V = leader, 12V = follower). For Koch arms, it's detected by motor model numbers.
+- **Arm Type Detection**: For SO100/SO101 arms, leader vs follower is detected by motor voltage (5V = leader, 12V = follower). For Koch arms, it's detected by motor model numbers. A Star Arm 102 is always the leader, and its presence selects the `stararm102` robot type even when an SO101 leader is plugged in alongside it.
 - **Cameras**: Both OpenCV and RealSense cameras are supported. RealSense requires `pyrealsense2`. You can map each camera to a viewing angle and pick which ones to display during Teleop/Record/Inference.
 
 ## Troubleshooting
@@ -321,3 +422,5 @@ solo robo --diagnose
 - **Windows symlink warnings**: Symlink warnings are suppressed for HF Hub downloads by the tool when needed.
 - **No cameras detected**: You can proceed without cameras; functionality remains available.
 - **RealMan connection issues**: Ensure the robot is powered, network-connected, and the IP/port settings in `realman_config.yaml` are correct.
+- **Star Arm 102 not found**: It needs 12V into the UC-01 board, and its board enumerates as a CH340 (`/dev/tty.usbserial*` on macOS, `/dev/ttyUSB*` on Linux) rather than the `usbmodem`/`ttyACM` device an SO arm presents. `solo robo --scan` reports it separately from Feetech and Dynamixel buses.
+- **Star Arm 102 joint moves the wrong way or over-travels**: Run `solo robo --star-tune` and flip that joint's direction or lower its gain. If it was never calibrated, teleop refuses to start - run `solo robo --calibrate leader` first.

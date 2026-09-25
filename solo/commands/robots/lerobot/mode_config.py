@@ -200,9 +200,51 @@ def save_replay_config(config: dict, replay_args: Dict) -> None:
         'dataset_repo_id': replay_args.get('dataset_repo_id'),
         'episode': replay_args.get('episode'),
         'fps': replay_args.get('fps'),
-        'play_sounds': replay_args.get('play_sounds')
+        'play_sounds': replay_args.get('play_sounds'),
+        'save_replay_as': replay_args.get('save_replay_as'),
+        'save_replay_resume': replay_args.get('save_replay_resume'),
+        'camera_config': replay_args.get('camera_config'),
+        'repeat': replay_args.get('repeat'),
+        'perturb': replay_args.get('perturb'),
+        'perturb_increment': replay_args.get('perturb_increment'),
     }
     save_mode_config(config, 'replay', replay_config)
+
+
+def save_deployx_config(config: dict, deployx_args: Dict) -> None:
+    """Save DeployX edge-agent-specific configuration."""
+    deployx_config = {
+        'robot_type': deployx_args.get('robot_type'),
+        'follower_port': deployx_args.get('follower_port'),
+        'follower_id': deployx_args.get('follower_id'),
+        'camera_config': deployx_args.get('camera_config'),
+        'server_url': deployx_args.get('server_url'),
+        'task_description': deployx_args.get('task_description'),
+        'fps': deployx_args.get('fps'),
+        'session_time': deployx_args.get('session_time'),
+        'push_repo_id': deployx_args.get('push_repo_id'),
+        'openwam_server_url': deployx_args.get('openwam_server_url'),
+    }
+    save_mode_config(config, 'deployx', deployx_config)
+
+
+def update_mode_config_port(config: dict, mode: str, key: str, value: str) -> None:
+    """
+    Update one port in one mode's saved configuration.
+
+    Unlike :func:`update_all_mode_config_ports`, this leaves the other modes alone,
+    so correcting (say) the teleop leader port for one robot type cannot point a
+    saved configuration for a different robot type at the wrong hardware.
+    """
+    mode_config = config.get('lerobot', {}).get('mode_configs', {}).get(mode)
+    if not isinstance(mode_config, dict) or mode_config.get(key) == value:
+        return
+
+    mode_config[key] = value
+    os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+    with open(CONFIG_PATH, 'w') as f:
+        json.dump(config, f, indent=4)
+    typer.echo(f"📝 Updated {key} in saved {mode} settings: {value}")
 
 
 def update_all_mode_config_ports(config: dict, leader_port: Optional[str] = None, follower_port: Optional[str] = None) -> None:

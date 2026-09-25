@@ -14,6 +14,8 @@ from typing import Optional
 from solo.commands.robots.lerobot.ports import detect_arm_port, detect_bimanual_arm_ports
 from solo.commands.robots.lerobot.config import (
     get_robot_config_classes,
+    create_leader_config,
+    is_starai_robot,
     save_lerobot_config,
     get_known_ids,
     add_known_id,
@@ -41,7 +43,9 @@ def calibrate_arm(arm_type: str, port: str, robot_type: str = "so100", arm_id: O
             return False
 
         if arm_type == "leader":
-            arm_config = leader_config_class(port=port, id=arm_id or f"{robot_type}_{arm_type}")
+            arm_config = create_leader_config(
+                leader_config_class, port, robot_type, leader_id=arm_id
+            )
             calibrate_config = CalibrateConfig(teleop=arm_config)
         else:
             arm_config = follower_config_class(port=port, id=arm_id or f"{robot_type}_{arm_type}")
@@ -49,6 +53,13 @@ def calibrate_arm(arm_type: str, port: str, robot_type: str = "so100", arm_id: O
         
         typer.echo(f"🔧 Calibrating {arm_type} arm on port {port}...")
         typer.echo("⚠️  Please follow the calibration instructions.")
+
+        if arm_type == "leader" and is_starai_robot(robot_type):
+            typer.echo(
+                "   Sweep every Star Arm 102 joint through its full travel — the recorded\n"
+                "   range sets the midpoint each joint angle is measured from, and the SO101\n"
+                "   follower is driven from those angles."
+            )
         
         calibrate(calibrate_config)
         typer.echo(f"✅ {arm_type.title()} arm calibrated successfully!")
@@ -182,6 +193,14 @@ def setup_motors_for_arm(arm_type: str, port: str, robot_type: str = "so100") ->
             return False
 
         if arm_type == "leader":
+            if is_starai_robot(robot_type):
+                # Star Arm 102 servos ship with fixed bus ids (0-6) and the FashionStar
+                # bus offers no id-assignment flow, so there is nothing to set up here.
+                typer.echo(
+                    "ℹ️  The Star Arm 102 leader has factory-assigned servo ids — no motor setup needed."
+                )
+                typer.echo("   Run 'solo robo --calibrate leader' next.")
+                return True
             config_class = leader_config_class
             make_device = make_teleoperator_from_config
         else:
@@ -509,6 +528,10 @@ def calibration(main_config: dict = None, arm_type: str = None) -> Dict:
         if setup_leader:
             # Use consolidated decision for leader port
             leader_port = existing_leader_port if reuse_all and existing_leader_port else None
+            if leader_port and is_starai_robot(robot_type):
+                # A reused port may belong to whichever leader was configured last.
+                from solo.commands.robots.lerobot.starai_config import resolve_starai_leader_port
+                leader_port = resolve_starai_leader_port(leader_port)
             if not leader_port:
                 leader_port, detected_type = detect_arm_port("leader", robot_type=robot_type)
                 # Update robot_type if auto-detected and not already set

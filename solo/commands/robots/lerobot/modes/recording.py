@@ -63,6 +63,12 @@ def recording_mode(config: dict, auto_use: bool = False):
         camera_config = preconfigured.get('camera_config')
         leader_id = preconfigured.get('leader_id')
         follower_id = preconfigured.get('follower_id')
+
+        from solo.commands.robots.lerobot.starai_config import ensure_starai_leader_port
+        leader_port = ensure_starai_leader_port(config, 'recording', robot_type, leader_port)
+        if not leader_port:
+            return
+
         dataset_repo_id = preconfigured.get('dataset_repo_id')
         # Clean ANSI escape codes to prevent file system errors
         if dataset_repo_id:
@@ -205,26 +211,23 @@ def recording_mode(config: dict, auto_use: bool = False):
         leader_id = prompt_arm_id(config, "leader", robot_type)
         follower_id = prompt_arm_id(config, "follower", robot_type)
 
-        # Step 1: HuggingFace authentication (optional)
+        # Step 1: HuggingFace authentication (required - recordings must be pushed to Hub
+        # so remote training, e.g. on Runpod, can pull the dataset without an SSH transfer)
         typer.echo("\n📋 Step 1: HuggingFace Hub Configuration")
-        push_to_hub = Confirm.ask("Would you like to push the recorded data to HuggingFace Hub?", default=False)
-        hf_username = None
-        
-        if push_to_hub:
-            login_success, hf_username = authenticate_huggingface()
-            
-            if not login_success:
-                typer.echo("❌ HuggingFace authentication failed. Continuing in local-only mode.")
-                push_to_hub = False
-                hf_username = None  # Clear username for local-only mode
-        
+        typer.echo("Pushing to HuggingFace Hub is required so datasets can be trained on remotely (e.g. Runpod).")
+        push_to_hub = True
+        login_success, hf_username = authenticate_huggingface()
+
+        if not login_success:
+            typer.echo("❌ HuggingFace authentication failed. Recording requires a HuggingFace login - please try again.")
+            raise typer.Exit(code=1)
+
         # Step 2: Get recording parameters
         typer.echo("\n⚙️ Step 2: Recording Configuration")
-        
+
         # Get dataset name and handle existing datasets
         dataset_name = Prompt.ask("Enter dataset repository name", default="lerobot-dataset")
-        # Only use HuggingFace username if we're actually pushing to hub
-        username_for_format = hf_username if push_to_hub else None
+        username_for_format = hf_username
         initial_repo_id = normalize_repo_id(dataset_name, hf_username=username_for_format)
         # Check if dataset exists and handle appropriately
         dataset_repo_id, should_resume = handle_existing_dataset(initial_repo_id)
@@ -240,7 +243,7 @@ def recording_mode(config: dict, auto_use: bool = False):
         
         # Ensure dataset_repo_id has proper format (owner/name or local/name)
         if '/' not in dataset_repo_id:
-            if push_to_hub and hf_username:
+            if hf_username:
                 # Use HuggingFace username format for hub uploads
                 dataset_repo_id = f"{hf_username}/{dataset_repo_id}"
                 typer.echo(f"🔧 Fixed dataset_repo_id format: '{dataset_repo_id}'")
@@ -248,14 +251,7 @@ def recording_mode(config: dict, auto_use: bool = False):
                 # Use local format for local-only datasets
                 dataset_repo_id = f"local/{dataset_repo_id}"
                 typer.echo(f"🔧 Fixed dataset_repo_id format: '{dataset_repo_id}'")
-        
-        # Force local format when not pushing to hub
-        if not push_to_hub and not dataset_repo_id.startswith('local/'):
-            typer.echo(f"⚠️  Not pushing to hub - converting '{dataset_repo_id}' to local format")
-            dataset_name_only = dataset_repo_id.split('/')[-1]
-            dataset_repo_id = f"local/{dataset_name_only}"
-            typer.echo(f"🔧 Using local dataset: '{dataset_repo_id}'")
-        
+
         # Get task description
         task_description = Prompt.ask("Enter task description (e.g., 'Pick up the red cube and place it in the box')")
         

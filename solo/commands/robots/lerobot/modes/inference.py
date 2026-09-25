@@ -84,6 +84,36 @@ def _find_latest_local_model() -> str | None:
     return latest_model
 
 
+def _offer_merge_into_dataset(config: dict, correction_repo_id: str) -> None:
+    """Push a HIL correction session and merge it into a base dataset for retraining."""
+    from solo.commands.robots.lerobot.mode_config import load_mode_config
+    from solo.commands.robots.lerobot.hil_merge import merge_correction_into_dataset
+
+    login_success, hf_username = authenticate_huggingface()
+    if not login_success:
+        typer.echo("❌ HuggingFace authentication required to merge datasets.")
+        return
+
+    training_config = load_mode_config(config, 'training')
+    default_base = training_config.get('dataset_repo_id') if training_config else None
+
+    base_repo_id = Prompt.ask("Base dataset to merge corrections into", default=default_base or "")
+    if not base_repo_id:
+        typer.echo("❌ No base dataset specified. Skipping merge.")
+        return
+
+    base_name = base_repo_id.split('/')[-1]
+    default_merged = f"{hf_username}/{base_name}-hil"
+    merged_repo_id = Prompt.ask("Name for the merged dataset", default=default_merged)
+
+    try:
+        merge_correction_into_dataset(base_repo_id, correction_repo_id, merged_repo_id)
+        typer.echo(f"✅ Merged dataset ready: {merged_repo_id}")
+        typer.echo(f"   Use this as the dataset repository ID next time you run 'solo robo --train'")
+    except Exception as e:
+        typer.echo(f"❌ Failed to merge datasets: {e}")
+
+
 def inference_mode(config: dict, auto_use: bool = False):
     """Handle LeRobot inference mode"""
     # Check for preconfigured inference settings
@@ -101,6 +131,12 @@ def inference_mode(config: dict, auto_use: bool = False):
         follower_port = preconfigured.get('follower_port')
         follower_id = preconfigured.get('follower_id')
         camera_config = preconfigured.get('camera_config')
+
+        from solo.commands.robots.lerobot.starai_config import ensure_starai_leader_port
+        leader_port = ensure_starai_leader_port(config, 'inference', robot_type, leader_port)
+        if not leader_port:
+            return
+
         policy_path = preconfigured.get('policy_path')
         task_description = preconfigured.get('task_description')
         inference_time = preconfigured.get('inference_time')
@@ -317,9 +353,13 @@ def inference_mode(config: dict, auto_use: bool = False):
             try:
                 # Start inference using unified record function (without dataset)
                 record(record_config)
-                
+
                 typer.echo("\n✅ Inference completed successfully!")
-                
+
+                if use_teleoperation:
+                    if Confirm.ask("\n🔁 Add this corrected session to a training dataset for retraining?", default=False):
+                        _offer_merge_into_dataset(config, record_config.dataset.repo_id)
+
                 break  # Success, exit retry loop
                 
             except Exception as e:

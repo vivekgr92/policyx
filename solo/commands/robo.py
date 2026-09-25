@@ -21,9 +21,14 @@ def robo(
     yes: bool,
     # Replay-specific options (non-interactive)
     dataset: str = None,
-    episode: int = None,
+    episode: str = None,
     follower_id: str = None,
     fps: int = None,
+    deployx_run: str = None,
+    save_replay_as: str = None,
+    repeat: int = None,
+    perturb: float = None,
+    perturb_increment: float = None,
 ):
     """
     Robotics operations: motor setup, calibration, teleoperation, data recording, training, replay, and inference
@@ -46,8 +51,12 @@ def robo(
         'dataset': dataset,
         'episode': episode,
         'follower_id': follower_id,
-        'fps': fps
+        'fps': fps,
+        'save_replay_as': save_replay_as,
+        'repeat': repeat,
+        'perturb': perturb,
+        'perturb_increment': perturb_increment,
     } if replay else None
     
     # Use LeRobot handler directly
-    lerobot.handle_lerobot(config, calibrate, motors, teleop, record, train, inference, replay, yes, replay_options) 
+    lerobot.handle_lerobot(config, calibrate, motors, teleop, record, train, inference, replay, yes, replay_options, deployx_run)

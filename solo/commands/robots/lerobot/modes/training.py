@@ -3,6 +3,7 @@ Training mode for LeRobot
 Handles policy training on recorded datasets
 """
 
+import os
 import subprocess
 import typer
 from pathlib import Path
@@ -19,7 +20,7 @@ def training_mode(config: dict, auto_use: bool = False):
     # Check for preconfigured training settings
     preconfigured, detected_robot_type = use_preconfigured_args(config, 'training', 'Training', auto_use=auto_use)
     training_args = {}
-    
+
     if preconfigured:
         # Use preconfigured settings
         dataset_repo_id = preconfigured.get('dataset_repo_id')
@@ -58,7 +59,7 @@ def training_mode(config: dict, auto_use: bool = False):
         policy_repo_id = training_args.get('policy_repo_id', "")
         use_wandb = training_args.get('use_wandb', True)
         wandb_project = training_args.get('wandb_project', "lerobot-training")
-        
+
     else:
         # Get default dataset from recording config if available
         recording_config = load_mode_config(config, 'recording')
@@ -105,14 +106,20 @@ def training_mode(config: dict, auto_use: bool = False):
         typer.echo("3. PI0 (Policy Iteration Zero)")
         typer.echo("4. TDMPC (Temporal Difference MPC)")
         typer.echo("5. Diffusion Policy (good for most tasks)")
-        
+        typer.echo("6. VQ-BeT (Vector-Quantized Behavior Transformer)")
+        typer.echo("7. PI0-FAST (faster PI0 variant)")
+        typer.echo("8. PI0.5 (newer PI0 generation)")
+
         policy_choice = Prompt.ask("Enter policy type", default="1")
         policy_name_map = {
             "1": "smolvla",
-            "2": "act", 
+            "2": "act",
             "3": "pi0",
             "4": "tdmpc",
-            "5": "diffusion"
+            "5": "diffusion",
+            "6": "vqbet",
+            "7": "pi0_fast",
+            "8": "pi05",
         }
         policy_name = policy_name_map[policy_choice]
         
@@ -184,6 +191,28 @@ def training_mode(config: dict, auto_use: bool = False):
                 typer.echo("Continuing without WandB logging.")
                 use_wandb = False
     
+    # Step 4.5: Choose where to train
+    # SOLO_REMOTE_TRAINING is set by runpod_train.py when it invokes this same
+    # command over SSH on the pod itself - always train locally there instead of
+    # prompting (which would either hang or try to recurse into another pod).
+    if os.environ.get("SOLO_REMOTE_TRAINING") == "1":
+        compute_location = "local"
+        compare_all_policies = False
+    else:
+        typer.echo(f"\n🖥️  Step 4.5: Compute Location")
+        compute_location = Prompt.ask(
+            "Where do you want to run training?",
+            choices=["local", "runpod"],
+            default="runpod"
+        )
+        compare_all_policies = False
+        if compute_location == "runpod":
+            compare_all_policies = Confirm.ask(
+                "Compare ALL policy types in parallel instead - one Runpod GPU per policy, "
+                "same dataset/steps/batch size (no if you just want the policy you picked above)?",
+                default=False,
+            )
+
     # Check if dataset exists locally
     if check_dataset_exists(dataset_repo_id):
         typer.echo(f"✅ Found local dataset: {dataset_repo_id}")
@@ -220,7 +249,7 @@ def training_mode(config: dict, auto_use: bool = False):
         else:
             typer.echo("📁 Directory exists.")
             choice = Prompt.ask(
-                "What would you like to do?", 
+                "What would you like to do?",
                 choices=["overwrite", "new_dir"],
                 default="overwrite"
             )
@@ -245,6 +274,7 @@ def training_mode(config: dict, auto_use: bool = False):
     # Step 5: Start training
     typer.echo(f"\n🎓 Step 5: Starting Training")
     typer.echo("Configuration:")
+    typer.echo(f"   • Compute: {'Runpod (remote GPU pod)' if compute_location == 'runpod' else 'Local (this machine)'}")
     typer.echo(f"   • Dataset: {dataset_repo_id}")
     typer.echo(f"   • Policy: {policy_name}")
     typer.echo(f"   • Training steps: {training_steps}")
@@ -258,7 +288,7 @@ def training_mode(config: dict, auto_use: bool = False):
     if use_wandb:
         typer.echo(f"   • WandB project: {wandb_project}")
     
-    # Save configuration before execution (if not using preconfigured settings)
+    # Save configuration before execution (if not using preconfigured or file-based settings)
     if not preconfigured:
         from solo.commands.robots.lerobot.mode_config import save_training_config
         training_args = {
@@ -277,6 +307,34 @@ def training_mode(config: dict, auto_use: bool = False):
         }
         save_training_config(config, training_args)
 
+    if compute_location == "runpod" and compare_all_policies:
+        from solo.commands.robots.lerobot.runpod_train import run_policy_comparison_on_runpod
+        run_policy_comparison_on_runpod(
+            dataset_repo_id=dataset_repo_id,
+            training_steps=training_steps,
+            batch_size=batch_size,
+            push_to_hub=push_to_hub,
+            use_wandb=use_wandb,
+            wandb_project=wandb_project,
+        )
+        return
+
+    if compute_location == "runpod":
+        from solo.commands.robots.lerobot.runpod_train import run_training_on_runpod
+        run_training_on_runpod(
+            dataset_repo_id=dataset_repo_id,
+            policy_name=policy_name,
+            training_steps=training_steps,
+            batch_size=batch_size,
+            output_dir=output_dir,
+            push_to_hub=push_to_hub,
+            policy_repo_id=policy_repo_id,
+            use_wandb=use_wandb,
+            wandb_project=wandb_project,
+            pretrained_policy_path=pretrained_policy_path,
+        )
+        return
+
     # Import lerobot training components
     from lerobot.scripts.lerobot_train import train
     from lerobot.configs.train import TrainPipelineConfig
@@ -287,7 +345,10 @@ def training_mode(config: dict, auto_use: bool = False):
     from lerobot.policies.tdmpc.configuration_tdmpc import TDMPCConfig
     from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
     from lerobot.policies.pi0.configuration_pi0 import PI0Config
-    
+    from lerobot.policies.vqbet.configuration_vqbet import VQBeTConfig
+    from lerobot.policies.pi0_fast.configuration_pi0_fast import PI0FastConfig
+    from lerobot.policies.pi05.configuration_pi05 import PI05Config
+
     # Suppress warnings
     import warnings
     warnings.filterwarnings("ignore", category=UserWarning, module="torchvision")
@@ -339,6 +400,12 @@ def training_mode(config: dict, auto_use: bool = False):
                 policy_config = SmolVLAConfig()
             elif policy_name == "pi0":
                 policy_config = PI0Config()
+            elif policy_name == "vqbet":
+                policy_config = VQBeTConfig()
+            elif policy_name == "pi0_fast":
+                policy_config = PI0FastConfig()
+            elif policy_name == "pi05":
+                policy_config = PI05Config()
             else:
                 raise ValueError(f"Unknown policy type: {policy_name}")
         
@@ -383,7 +450,10 @@ def training_mode(config: dict, auto_use: bool = False):
                     typer.echo(f"   📷 Auto-mapping: {dataset_image_keys[0]} → observation.images.camera1")
                 elif set(dataset_image_keys) != set(default_policy_cameras[:len(dataset_image_keys)]):
                     typer.echo(f"   ⚠️  Camera names don't match policy defaults.")
-                    use_rename = Confirm.ask("   Would you like to auto-map cameras?", default=True)
+                    if os.environ.get("SOLO_REMOTE_TRAINING") == "1":
+                        use_rename = True  # no prompts in unattended/config-driven runs
+                    else:
+                        use_rename = Confirm.ask("   Would you like to auto-map cameras?", default=True)
                     if use_rename:
                         for i, cam in enumerate(dataset_image_keys):
                             if i < 3:  # Map up to 3 cameras

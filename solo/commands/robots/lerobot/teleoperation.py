@@ -11,6 +11,8 @@ from typing import Optional
 from solo.commands.robots.lerobot.config import (
     get_robot_config_classes,
     create_follower_config,
+    create_leader_config,
+    is_starai_robot,
     save_lerobot_config,
     is_bimanual_robot,
     is_realman_robot,
@@ -34,7 +36,12 @@ def teleoperation(config: dict = None, auto_use: bool = False) -> bool:
         camera_config = preconfigured.get('camera_config')
         leader_id = preconfigured.get('leader_id')
         follower_id = preconfigured.get('follower_id')
-    
+
+        from solo.commands.robots.lerobot.starai_config import ensure_starai_leader_port
+        leader_port = ensure_starai_leader_port(config, 'teleop', robot_type, leader_port)
+        if not leader_port:
+            return False
+
 
     if not preconfigured:
         # Validate configuration using utility function
@@ -160,7 +167,13 @@ def teleoperation(config: dict = None, auto_use: bool = False) -> bool:
             )
         else:
             # Create single-arm configurations
-            leader_config = leader_config_class(port=leader_port, id=leader_id)
+            leader_config = create_leader_config(
+                leader_config_class,
+                leader_port,
+                robot_type,
+                leader_id=leader_id,
+                follower_id=follower_id,
+            )
             
             # Create robot config with cameras if enabled
             follower_config = create_follower_config(
@@ -207,6 +220,12 @@ def teleoperation(config: dict = None, auto_use: bool = False) -> bool:
         elif is_bimanual_robot(robot_type):
             typer.echo("🎮 Starting bimanual teleoperation... Press Ctrl+C to stop.")
             typer.echo("📋 Move BOTH leader arms to control BOTH follower arms.")
+        elif is_starai_robot(robot_type):
+            from solo.commands.robots.lerobot.starai_config import describe_starai_map
+            typer.echo("🎮 Starting teleoperation... Press Ctrl+C to stop.")
+            typer.echo("📋 Move the Star Arm 102 leader to control the SO101 follower.")
+            describe_starai_map()
+            typer.echo("\n💡 If a joint runs backwards or over/under-travels, stop and run 'solo robo --star-tune'.")
         else:
             typer.echo("🎮 Starting teleoperation... Press Ctrl+C to stop.")
             typer.echo("📋 Move the leader arm to control the follower arm.")
@@ -257,7 +276,13 @@ def teleoperation(config: dict = None, auto_use: bool = False) -> bool:
                         if new_leader_port != leader_port or new_follower_port != follower_port:
                             # Update ports and recreate configs
                             leader_port, follower_port = new_leader_port, new_follower_port
-                            leader_config = leader_config_class(port=leader_port, id=leader_id)
+                            leader_config = create_leader_config(
+                                leader_config_class,
+                                leader_port,
+                                robot_type,
+                                leader_id=leader_id,
+                                follower_id=follower_id,
+                            )
                             follower_config = create_follower_config(
                                 follower_config_class,
                                 follower_port,

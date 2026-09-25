@@ -48,6 +48,7 @@ pytest
 - `solo/utils/hardware.py` - Hardware detection (CPU, GPU - NVIDIA/AMD/Apple Silicon, memory)
 - `solo/config/` - YAML defaults (`config.yaml`) + user JSON config (`~/.solo/config.json`)
 - `solo/commands/robots/lerobot/` - LeRobot robotics integration (calibration, teleop, recording, training, inference)
+- `solo/commands/robots/lerobot/teleoperators/` - Solo-provided LeRobot teleoperators, e.g. the Star Arm 102 (StarAI/Fashionstar) leader remapped onto SO101 joints; paired with `starai_config.py` (mapping saved in `~/.solo/starai_map.json`) and `starai_tune.py` (`solo robo --star-tune`)
 - `solo/mcp/` - Domain-specific Model Context Protocol implementations (agriculture, education, healthcare, etc.)
 
 **Multi-platform support:** Hardware detection and server selection adapt to CUDA (NVIDIA), HIP (AMD), Metal (Apple Silicon), and CPU-only environments.

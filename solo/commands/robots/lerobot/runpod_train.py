@@ -339,7 +339,7 @@ def _wait_until_ready(client: RunpodClient, pod_id: str, timeout: int = 600) -> 
     # Direct SSH (public IP + port mapping) can take several minutes to appear
     # after a pod reports RUNNING - observed ~6 minutes on Secure Cloud.
     elapsed = 0
-    last_status = None
+    last_report = None
     while elapsed < timeout:
         try:
             pod = client.get_pod(pod_id)
@@ -352,13 +352,35 @@ def _wait_until_ready(client: RunpodClient, pod_id: str, timeout: int = 600) -> 
                 ) from e
             raise
         status = pod.get("desiredStatus")
-        if status != last_status:
-            typer.echo(f"   ... pod status: {status}")
-            last_status = status
-        if status == "RUNNING" and (pod.get("portMappings") or {}).get("22"):
+        public_ip = pod.get("publicIp") or ""
+        ssh_port = (pod.get("portMappings") or {}).get("22")
+
+        # Report the real bottleneck, not just "RUNNING" - a pod can sit at
+        # RUNNING for minutes with no network assignment yet (observed live,
+        # both a case that resolved normally after ~1min and one that never
+        # did after 8+min on a bad Community host), so surface exactly which
+        # of status/IP/port is still missing rather than going quiet.
+        if ssh_port:
+            report = f"RUNNING, network ready ({public_ip}:{ssh_port})"
+        elif public_ip:
+            report = f"RUNNING, public IP assigned ({public_ip}), waiting for SSH port mapping..."
+        elif status == "RUNNING":
+            report = "RUNNING, waiting for network assignment (public IP)..."
+        else:
+            report = status
+        if report != last_report:
+            typer.echo(f"   ... pod status: {report}  [{elapsed}s elapsed]")
+            last_report = report
+
+        if status == "RUNNING" and ssh_port:
             return pod
         time.sleep(10)
         elapsed += 10
+        # Re-print the current report periodically even if unchanged, so a long
+        # stall (e.g. a stuck Community host) is visibly still being watched
+        # rather than looking hung with no output.
+        if elapsed % 60 == 0:
+            typer.echo(f"   ... still waiting: {report}  [{elapsed}s elapsed]")
     raise TimeoutError(
         f"Pod {pod_id} did not get a direct SSH port mapping within {timeout}s. "
         "Note: Runpod's SSH proxy (ssh.runpod.io) is not used here because it forces an "

@@ -341,7 +341,16 @@ def _wait_until_ready(client: RunpodClient, pod_id: str, timeout: int = 600) -> 
     elapsed = 0
     last_status = None
     while elapsed < timeout:
-        pod = client.get_pod(pod_id)
+        try:
+            pod = client.get_pod(pod_id)
+        except requests.HTTPError as e:
+            if e.response is not None and e.response.status_code == 404:
+                raise RuntimeError(
+                    f"Pod {pod_id} no longer exists (it may have been stopped/terminated by "
+                    "someone or something else while this command was waiting on it). "
+                    "Please re-run to create a fresh pod."
+                ) from e
+            raise
         status = pod.get("desiredStatus")
         if status != last_status:
             typer.echo(f"   ... pod status: {status}")
@@ -439,7 +448,7 @@ def rsync_from_pod(pod: dict, key_path: Path, remote_path: str, local_path: str)
 # Bootstrap + dataset sync
 # ---------------------------------------------------------------------------
 
-SOLO_REPO_URL = "https://github.com/GetSoloTech/solo-cli.git"
+SOLO_REPO_URL = "https://github.com/vivekgr92/policyx.git"
 
 
 # pi0 / pi0_fast / pi05 all build on PaliGemma-family modeling code that requires a

@@ -89,11 +89,16 @@ def _start_server_remote(pod: dict, key_path: Path, checkpoint_ref: str, port: i
         )
 
 
-def deploy_policy_server_to_runpod(checkpoint_path: str, port: Optional[int] = None) -> str:
+def deploy_policy_server_to_runpod(checkpoint_path: str, port: Optional[int] = None) -> dict:
     """
     Provision/reuse a Runpod pod, install solo-cli on it, start the DeployX
-    policy server for `checkpoint_path`, and return the ws:// URL the edge
-    agent should connect to.
+    policy server for `checkpoint_path`, and return connection info.
+
+    `_ensure_port_exposed()` opens the DeployX port directly on the pod and
+    waits for Runpod's public port mapping, so the returned `ws_url` is
+    reachable straight from the edge agent - no SSH tunnel needed (unlike a
+    pod created without that port exposed, e.g. by hand via `--train`'s pod
+    flow, which only opens 22/tcp and 8888/http).
     """
     port = port or protocol.DEFAULT_PORT
     typer.echo("\n☁️  DeployX: Runpod policy server deployment")
@@ -126,4 +131,10 @@ def deploy_policy_server_to_runpod(checkpoint_path: str, port: Optional[int] = N
         "   The checkpoint may still be loading in the background - poll with a "
         "'ping' message until the response has ready: true."
     )
-    return ws_url
+    return {
+        "ws_url": ws_url,
+        "pod_id": pod["id"],
+        "pod_name": pod["name"],
+        "ssh_host": pod["publicIp"],
+        "ssh_port": pod["portMappings"]["22"],
+    }

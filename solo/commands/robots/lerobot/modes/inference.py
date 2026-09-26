@@ -84,6 +84,30 @@ def _find_latest_local_model() -> str | None:
     return latest_model
 
 
+def _run_inference_on_runpod(policy_path: str) -> None:
+    """Deploy the DeployX policy server for `policy_path` on a Runpod GPU pod,
+    then print the exact command to run locally to actually drive the real
+    hardware. Calibration files stay local - they're only needed by the edge
+    agent (the process attached to the physical robot), never by the policy
+    server itself, so nothing needs to be copied to the pod for that.
+    """
+    from solo.commands.robots.lerobot.deployx.runpod_deployx import deploy_policy_server_to_runpod
+
+    try:
+        info = deploy_policy_server_to_runpod(policy_path)
+    except Exception as e:
+        typer.echo(f"❌ Failed to deploy the policy server to Runpod: {e}")
+        return
+
+    typer.echo("\n🤖 Next step - run this on the machine physically connected to the robot:")
+    typer.echo(f"\n   solo robo --deployx-run {info['ws_url']}")
+    typer.echo(
+        f"\n(Pod '{info['pod_name']}' ({info['pod_id']}) is billing while it's running - "
+        f"stop it from https://www.runpod.io/console/pods when you're done, "
+        f"or SSH in directly: ssh root@{info['ssh_host']} -p {info['ssh_port']})"
+    )
+
+
 def _offer_merge_into_dataset(config: dict, correction_repo_id: str) -> None:
     """Push a HIL correction session and merge it into a base dataset for retraining."""
     from solo.commands.robots.lerobot.mode_config import load_mode_config
@@ -204,7 +228,18 @@ def inference_mode(config: dict, auto_use: bool = False):
                 typer.echo("🎮 Teleoperation enabled - you can override the policy using the leader arm")
 
         follower_id = prompt_arm_id(config, "follower", robot_type)
-        
+
+        # Step 0.5: Compute location - run the policy locally (this machine, no
+        # safety layer - lerobot's own record() drives the robot directly) or on
+        # a Runpod GPU via DeployX (policy server on the pod, safety-validated
+        # actions, edge agent runs locally against the real hardware).
+        typer.echo("\n🖥️  Step 0.5: Compute Location")
+        compute_location = Prompt.ask(
+            "Where do you want to run the policy?",
+            choices=["local", "runpod"],
+            default="local",
+        )
+
         # Step 1: Get policy path first to determine if auth is needed
         typer.echo("\n🤖 Step 1: Policy Configuration")
 
@@ -269,7 +304,11 @@ def inference_mode(config: dict, auto_use: bool = False):
                     typer.echo("❌ Cannot proceed with inference without HuggingFace authentication.")
                     typer.echo("💡 If using a local model, provide the full path (e.g., /path/to/model or ./model)")
                     return
-        
+
+        if compute_location == "runpod":
+            _run_inference_on_runpod(policy_path)
+            return
+
         # Step 3: Inference configuration
         typer.echo("\n⚙️ Step 3: Inference Configuration")
         fps = 30  # Default FPS

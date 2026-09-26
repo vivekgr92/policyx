@@ -119,6 +119,7 @@ def replay_mode(config: dict, auto_use: bool = False, replay_options: dict = Non
         repeat_count = max(1, replay_options.get('repeat') or 1)
         perturb = replay_options.get('perturb') or 0.0
         perturb_increment = replay_options.get('perturb_increment') or 0.0
+        loop = bool(replay_options.get('loop') or False)
         camera_config = replay_options.get('camera_config')
         if camera_config is None:
             # No cameras passed on the CLI (there's no flag for that) - fall back
@@ -146,6 +147,7 @@ def replay_mode(config: dict, auto_use: bool = False, replay_options: dict = Non
             repeat_count = max(1, preconfigured.get('repeat') or 1)
             perturb = preconfigured.get('perturb') or 0.0
             perturb_increment = preconfigured.get('perturb_increment') or 0.0
+            loop = bool(preconfigured.get('loop') or False)
             camera_config = preconfigured.get('camera_config')
         else:
             # Get robot config
@@ -196,7 +198,20 @@ def replay_mode(config: dict, auto_use: bool = False, replay_options: dict = Non
             episode_raw = Prompt.ask(
                 "Enter episode(s) to replay (number, '0,2,5', '0-10', or 'all')", default="0"
             )
-            repeat_count = max(1, int(Prompt.ask("How many times to replay each selected episode?", default="1")))
+            loop = False
+            looks_like_multiple = "," in episode_raw or "-" in episode_raw or episode_raw.strip().lower() in ("all", "*")
+            if looks_like_multiple:
+                loop = Confirm.ask(
+                    "Loop mode: alternate playback between the selected episodes each cycle "
+                    "(e.g. play A→B, then B→A, then A→B again, ...) instead of finishing one "
+                    "episode's repeats before moving to the next?",
+                    default=False,
+                )
+            repeat_count = max(1, int(Prompt.ask(
+                "How many times to replay each selected episode?" if not loop else
+                "How many alternating cycles through the selected episodes?",
+                default="1",
+            )))
             perturb = float(Prompt.ask(
                 "Perturb replayed actions by this fraction of each joint's safe range for motion "
                 "diversity? (0 = replay exactly as recorded)",
@@ -243,7 +258,7 @@ def replay_mode(config: dict, auto_use: bool = False, replay_options: dict = Non
                 'dataset_repo_id': dataset_repo_id, 'episode': episode_raw, 'fps': fps, 'play_sounds': play_sounds,
                 'save_replay_as': save_replay_as, 'camera_config': camera_config,
                 'save_replay_resume': save_replay_resume, 'repeat': repeat_count, 'perturb': perturb,
-                'perturb_increment': perturb_increment,
+                'perturb_increment': perturb_increment, 'loop': loop,
             })
 
     # Import lerobot components
@@ -319,7 +334,7 @@ def replay_mode(config: dict, auto_use: bool = False, replay_options: dict = Non
                 'dataset_repo_id': dataset_repo_id, 'episode': episode_raw, 'fps': fps, 'play_sounds': play_sounds,
                 'save_replay_as': save_replay_as, 'camera_config': camera_config,
                 'save_replay_resume': save_replay_resume, 'repeat': repeat_count, 'perturb': perturb,
-                'perturb_increment': perturb_increment,
+                'perturb_increment': perturb_increment, 'loop': loop,
             })
 
         task_description = None
@@ -410,48 +425,60 @@ def replay_mode(config: dict, auto_use: bool = False, replay_options: dict = Non
                 robot = make_robot_from_config(follower_config)
                 robot.connect()
 
-                for ep in episodes:
-                    episode_frames = dataset.hf_dataset.filter(lambda x, ep=ep: x["episode_index"] == ep)
-                    actions = episode_frames.select_columns(ACTION)
+                # Loop mode: alternate through all selected episodes each cycle
+                # (e.g. play A->B, then B->A, then A->B again, ...) instead of
+                # finishing one episode's repeats before moving to the next.
+                if loop and len(episodes) > 1:
+                    typer.echo(f"\n🔁 Loop mode: alternating through episodes {episodes}, {repeat_count} cycle(s)")
+                    iteration_order = [(ep, rep) for rep in range(repeat_count) for ep in episodes]
+                else:
+                    iteration_order = [(ep, rep) for ep in episodes for rep in range(repeat_count)]
 
-                    for rep in range(repeat_count):
-                        # Ramp perturbation up (or down) per repeat, e.g. perturb=0.02,
-                        # perturb_increment=0.01 -> repeat 1 uses 0.02, repeat 2 uses 0.03.
-                        effective_perturb = max(0.0, perturb + rep * perturb_increment)
+                episode_frames_cache = {}
 
-                        label = f"episode {ep}"
-                        if repeat_count > 1:
-                            label += f" (repeat {rep + 1}/{repeat_count})"
-                            if perturb_increment != 0:
-                                label += f", perturb={effective_perturb * 100:.1f}%"
-                        typer.echo(f"\n📊 Replaying {label} ({len(episode_frames)} frames)")
-                        log_say("Replaying episode", play_sounds, blocking=True)
+                for ep, rep in iteration_order:
+                    if ep not in episode_frames_cache:
+                        ef = dataset.hf_dataset.filter(lambda x, ep=ep: x["episode_index"] == ep)
+                        episode_frames_cache[ep] = (ef, ef.select_columns(ACTION))
+                    episode_frames, actions = episode_frames_cache[ep]
 
-                        for idx in range(len(episode_frames)):
-                            start_t = time.perf_counter()
+                    # Ramp perturbation up (or down) per repeat, e.g. perturb=0.02,
+                    # perturb_increment=0.01 -> repeat 1 uses 0.02, repeat 2 uses 0.03.
+                    effective_perturb = max(0.0, perturb + rep * perturb_increment)
 
-                            action = {name: actions[idx][ACTION][i] for i, name in enumerate(dataset.features[ACTION]["names"])}
-                            obs = robot.get_observation()
+                    label = f"episode {ep}"
+                    if repeat_count > 1:
+                        label += f" (repeat {rep + 1}/{repeat_count})" if not loop else f" (cycle {rep + 1}/{repeat_count})"
+                        if perturb_increment != 0:
+                            label += f", perturb={effective_perturb * 100:.1f}%"
+                    typer.echo(f"\n📊 Replaying {label} ({len(episode_frames)} frames)")
+                    log_say("Replaying episode", play_sounds, blocking=True)
 
-                            if limits is not None and effective_perturb > 0:
-                                action = _perturb_action(action, obs, limits, effective_perturb, dt=1.0 / fps)
+                    for idx in range(len(episode_frames)):
+                        start_t = time.perf_counter()
 
-                            processed_action = robot_action_processor((action, obs))
-                            robot.send_action(processed_action)
+                        action = {name: actions[idx][ACTION][i] for i, name in enumerate(dataset.features[ACTION]["names"])}
+                        obs = robot.get_observation()
 
-                            log_rerun_data(observation=obs, action=processed_action)
+                        if limits is not None and effective_perturb > 0:
+                            action = _perturb_action(action, obs, limits, effective_perturb, dt=1.0 / fps)
 
-                            if new_dataset is not None:
-                                from lerobot.datasets.utils import build_dataset_frame
-                                observation_frame = build_dataset_frame(new_dataset.features, obs, prefix=OBS_STR)
-                                action_frame = build_dataset_frame(new_dataset.features, processed_action, prefix=ACTION)
-                                new_dataset.add_frame({**observation_frame, **action_frame, "task": task_description})
+                        processed_action = robot_action_processor((action, obs))
+                        robot.send_action(processed_action)
 
-                            precise_sleep(1 / fps - (time.perf_counter() - start_t))
+                        log_rerun_data(observation=obs, action=processed_action)
 
                         if new_dataset is not None:
-                            new_dataset.save_episode()
-                            typer.echo(f"💾 Saved replayed {label} as a new episode in '{save_replay_as}'")
+                            from lerobot.datasets.utils import build_dataset_frame
+                            observation_frame = build_dataset_frame(new_dataset.features, obs, prefix=OBS_STR)
+                            action_frame = build_dataset_frame(new_dataset.features, processed_action, prefix=ACTION)
+                            new_dataset.add_frame({**observation_frame, **action_frame, "task": task_description})
+
+                        precise_sleep(1 / fps - (time.perf_counter() - start_t))
+
+                    if new_dataset is not None:
+                        new_dataset.save_episode()
+                        typer.echo(f"💾 Saved replayed {label} as a new episode in '{save_replay_as}'")
 
                 robot.disconnect()
                 typer.echo(f"\n✅ Replay completed! ({len(episodes)} episode(s) x {repeat_count} repeat(s))")
@@ -503,7 +530,7 @@ def replay_mode(config: dict, auto_use: bool = False, replay_options: dict = Non
                                     'play_sounds': play_sounds, 'save_replay_as': save_replay_as,
                                     'save_replay_resume': save_replay_resume, 'camera_config': camera_config,
                                     'repeat': repeat_count, 'perturb': perturb,
-                                    'perturb_increment': perturb_increment,
+                                    'perturb_increment': perturb_increment, 'loop': loop,
                                 })
 
                                 follower_config = _build_follower_config(follower_port)

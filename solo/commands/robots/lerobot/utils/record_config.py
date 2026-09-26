@@ -157,6 +157,13 @@ def unified_record_config(
             push_to_hub=push_to_hub,
             fps=mode_specific_kwargs.get('fps', 30),
             video=True,
+            # Encode video frames in real-time during capture instead of after each
+            # episode ends - makes save_episode() near-instant so the next episode
+            # (e.g. the alternating A<->B loop) can start immediately with no
+            # per-episode encoding wait.
+            streaming_encoding=True,
+            vcodec="auto",
+            encoder_threads=2,
         )
         
         record_config = RecordConfig(

@@ -46,7 +46,94 @@ def cleanup_rerun():
             pass
 
 
-def recording_mode(config: dict, auto_use: bool = False):
+def _speak(text: str) -> None:
+    """Speak `text` out loud (macOS only, best-effort, non-blocking) so the user
+    doesn't have to look at the screen mid-task to know which task is next."""
+    if sys.platform == "darwin":
+        try:
+            subprocess.Popen(["say", text], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+
+
+def _run_alternating_multitask_recording(
+    base_kwargs: dict,
+    task_list: list,
+    num_episodes: int,
+    push_to_hub: bool,
+    should_resume: bool,
+) -> None:
+    """Record `num_episodes` continuously in one session, cycling the task label
+    per episode (episode_index % len(task_list)) so one dataset holds every
+    direction of an alternating task (e.g. pick A->B, then B->A) for multi-task
+    policy training.
+
+    Each episode is its own lerobot `record()` call with num_episodes=1 so lerobot's
+    own dataset/video-encoding lifecycle is reused untouched (resuming the same
+    dataset after episode 1). A side effect: lerobot's normal ~60s "reset
+    environment" pause between episodes never triggers, since alternating the task
+    already puts the object back at the next episode's start position - the only
+    per-episode overhead is the robot/camera reconnect each `record()` call does.
+    """
+    import lerobot.scripts.lerobot_record as lerobot_record_module
+    from solo.commands.robots.lerobot.utils.record_config import unified_record_config
+
+    typer.echo(f"\n🔁 Alternating multi-task mode: cycling {len(task_list)} tasks across {num_episodes} episodes")
+    for i, t in enumerate(task_list):
+        typer.echo(f"   {i + 1}. {t}")
+    typer.echo("   (→ Right Arrow = next episode/task, ← Left Arrow = re-record, ESC = stop session & upload)\n")
+
+    dataset = None
+    resume = should_resume
+    for ep_idx in range(num_episodes):
+        current_task = task_list[ep_idx % len(task_list)]
+        is_last = ep_idx == num_episodes - 1
+
+        typer.echo(f"\n▶️  Episode {ep_idx + 1}/{num_episodes} — task: {current_task}")
+        if ep_idx == 0:
+            _speak(f"Starting {current_task}")
+        else:
+            _speak(f"Switching to {current_task}")
+
+        kwargs = {**base_kwargs, 'task_description': current_task, 'num_episodes': 1, 'should_resume': resume}
+        record_config = unified_record_config(**kwargs)
+        # Only push to hub on the final episode - pushing after every single
+        # episode would be far too slow for continuous, at-scale collection.
+        record_config.dataset.push_to_hub = push_to_hub and is_last
+
+        original_init_listener = lerobot_record_module.init_keyboard_listener
+        captured = {}
+
+        def _wrapped_init_keyboard_listener(*args, _orig=original_init_listener, **kw):
+            listener, events = _orig(*args, **kw)
+            captured['events'] = events
+            return listener, events
+
+        lerobot_record_module.init_keyboard_listener = _wrapped_init_keyboard_listener
+        try:
+            dataset = lerobot_record_module.record(record_config)
+        finally:
+            lerobot_record_module.init_keyboard_listener = original_init_listener
+
+        resume = True  # every episode after the first appends to the same dataset
+
+        stopped_early = bool(captured.get('events', {}).get('stop_recording', False))
+        if stopped_early:
+            typer.echo("🛑 Stopped early (ESC) — ending alternating session.")
+            if push_to_hub and not record_config.dataset.push_to_hub:
+                typer.echo("🚀 Uploading dataset to HuggingFace Hub...")
+                dataset.push_to_hub()
+            break
+
+    if dataset is not None:
+        typer.echo("✅ Alternating multi-task recording completed!")
+        typer.echo(f"📈 Total episodes in dataset: {dataset.num_episodes}")
+        if push_to_hub:
+            repo_id = base_kwargs.get('dataset_repo_id')
+            typer.echo(f"🚀 Dataset pushed to HuggingFace Hub: https://huggingface.co/datasets/{repo_id}")
+
+
+def recording_mode(config: dict, auto_use: bool = False, loop: bool = False):
     """Handle LeRobot recording mode"""
     # Check for preconfigured recording settings
     preconfigured, detected_robot_type = use_preconfigured_args(config, 'recording', 'Recording', auto_use=auto_use)
@@ -252,8 +339,20 @@ def recording_mode(config: dict, auto_use: bool = False):
                 dataset_repo_id = f"local/{dataset_repo_id}"
                 typer.echo(f"🔧 Fixed dataset_repo_id format: '{dataset_repo_id}'")
 
-        # Get task description
-        task_description = Prompt.ask("Enter task description (e.g., 'Pick up the red cube and place it in the box')")
+        # Get task description (--loop switches to the alternating multi-task
+        # prompt; plain `solo robo --record` keeps the original single-task wording)
+        if loop:
+            num_options = int(Prompt.ask("How many alternating tasks?", default="2"))
+            default_task_labels = {0: "Pick A to B", 1: "Pick B to A"}
+            options = []
+            for i in range(num_options):
+                default_task = default_task_labels.get(i, "")
+                options.append(Prompt.ask(f"Option {i + 1} - task description", default=default_task))
+            task_description = "|".join(options)
+        else:
+            task_description = Prompt.ask(
+                "Enter task description (e.g., 'Pick up the red cube and place it in the box')"
+            )
         
         # Get episode time
         episode_time = float(Prompt.ask("Duration of each recording episode in seconds", default="60"))
@@ -284,10 +383,18 @@ def recording_mode(config: dict, auto_use: bool = False):
         }
         save_recording_config(config, recording_args)
 
+    # Parse task_description into a list - supports alternating multi-task recording
+    # (e.g. "Pick A->B|Pick B->A") so episodes cycle through tasks without ever
+    # stopping the session or re-entering the task string.
+    task_list = [t.strip() for t in task_description.split('|') if t.strip()] or [task_description]
+
     # Step 3: Start recording
     typer.echo("\n🎬 Starting Data Recording")
     typer.echo(f"   • Dataset: {dataset_repo_id}")
-    typer.echo(f"   • Task: {task_description}")
+    if len(task_list) > 1:
+        typer.echo(f"   • Tasks (alternating): {' → '.join(task_list)}")
+    else:
+        typer.echo(f"   • Task: {task_description}")
     typer.echo(f"   • Episode duration: {episode_time}s")
     typer.echo(f"   • Number of episodes: {num_episodes}")
     typer.echo(f"   • Push to hub: {push_to_hub}")
@@ -333,8 +440,15 @@ def recording_mode(config: dict, auto_use: bool = False):
                 'right_follower_port': lerobot_config.get('right_follower_port'),
             })
         
+        if len(task_list) > 1:
+            _run_alternating_multitask_recording(
+                record_config_kwargs, task_list, num_episodes, push_to_hub, should_resume
+            )
+            cleanup_rerun()
+            return
+
         record_config = unified_record_config(**record_config_kwargs)
-        
+
         if should_resume:
             typer.echo("📝 Resuming — recording will continue from existing dataset")
         

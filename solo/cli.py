@@ -19,6 +19,15 @@ def robo(
     ),
     teleop: bool = typer.Option(False, "--teleop", help="Start teleoperation (requires calibrated arms)"),
     record: bool = typer.Option(False, "--record", help="Record data for training (requires calibrated arms)"),
+    loop: bool = typer.Option(
+        False,
+        "--loop",
+        help="With --record: enable continuous alternating multi-task recording "
+        "(cycle through '|'-separated tasks, e.g. pick A→B / B→A, with no manual reset between episodes). "
+        "With --replay (and 2+ selected episodes): alternate playback between the selected episodes "
+        "each repeat cycle (e.g. play A→B, then B→A, then A→B again, ...) instead of finishing one "
+        "episode's repeats before moving to the next.",
+    ),
     train: bool = typer.Option(False, "--train", help="Train a model (requires recorded data)"),
     inference: bool = typer.Option(False, "--inference", help="Run inference on a pre-trained model"),
     replay: bool = typer.Option(False, "--replay", help="Replay actions from a recorded dataset episode"),
@@ -102,7 +111,7 @@ def robo(
         run_policy_server(deployx_serve, port=deployx_port)
         return
     from solo.commands.robo import robo as _robo
-    _robo(motors, calibrate, teleop, record, train, inference, replay, yes, dataset, episode, follower_id, fps, deployx_run, save_replay_as, repeat, perturb, perturb_increment)
+    _robo(motors, calibrate, teleop, record, train, inference, replay, yes, dataset, episode, follower_id, fps, deployx_run, save_replay_as, repeat, perturb, perturb_increment, loop)
 
 
 @app.command()

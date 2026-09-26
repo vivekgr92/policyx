@@ -29,6 +29,7 @@ def robo(
     repeat: int = None,
     perturb: float = None,
     perturb_increment: float = None,
+    loop: bool = False,
 ):
     """
     Robotics operations: motor setup, calibration, teleoperation, data recording, training, replay, and inference
@@ -56,7 +57,8 @@ def robo(
         'repeat': repeat,
         'perturb': perturb,
         'perturb_increment': perturb_increment,
+        'loop': loop,
     } if replay else None
     
     # Use LeRobot handler directly
-    lerobot.handle_lerobot(config, calibrate, motors, teleop, record, train, inference, replay, yes, replay_options, deployx_run)
+    lerobot.handle_lerobot(config, calibrate, motors, teleop, record, train, inference, replay, yes, replay_options, deployx_run, loop)

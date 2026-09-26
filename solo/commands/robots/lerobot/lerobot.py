@@ -9,7 +9,7 @@ from rich.console import Console
 
 console = Console()
 
-def handle_lerobot(config: dict, calibrate: str, motors: str, teleop: bool, record: bool, train: bool, inference: bool = False, replay: bool = False, auto_use: bool = False, replay_options: dict = None, deployx_run: str = None):
+def handle_lerobot(config: dict, calibrate: str, motors: str, teleop: bool, record: bool, train: bool, inference: bool = False, replay: bool = False, auto_use: bool = False, replay_options: dict = None, deployx_run: str = None, loop: bool = False):
     """Handle LeRobot framework operations"""
     # Import lerobot for operations that need it immediately at top level
     # Calibration and motor setup do lazy imports with loading spinners
@@ -33,7 +33,7 @@ def handle_lerobot(config: dict, calibrate: str, motors: str, teleop: bool, reco
     elif record:
         # Recording mode - check for existing calibration and setup recording
         from solo.commands.robots.lerobot.modes import recording_mode
-        recording_mode(config, auto_use)
+        recording_mode(config, auto_use, loop)
     elif inference:
         # Inference mode - run pretrained policy on robot
         from solo.commands.robots.lerobot.modes import inference_mode

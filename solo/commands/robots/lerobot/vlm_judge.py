@@ -63,19 +63,31 @@ class JudgeResult:
     reason: str
 
 # Local Ollama backend (default) - see module docstring for cost/rationale.
-# qwen3-vl:4b chosen as the final pick (confirmed by the user) over
-# qwen2.5vl:7b (same Qwen-VL lineage already proven on the Runpod backend,
-# but 7B's ~5-9GB real runtime footprint leaves uncomfortably little headroom
-# on this machine's real hardware - confirmed via sysctl/system_profiler:
-# Mac mini, Apple M4, 16GB unified memory) and over llava:7b (older
-# architecture, no longer the best fit now that Ollama has first-class
-# Qwen3-VL support). Qwen3-VL is a newer generation than Qwen2.5-VL, and
-# Ollama's own team describes its smaller sizes as working "exceptionally
-# well for their size" - the 4B size trades some raw quality for
-# substantially more memory headroom on 16GB unified memory. Override via
-# OLLAMA_JUDGE_MODEL if a different local model fits better in practice.
+# qwen3-vl:4b-instruct chosen as the final pick over qwen2.5vl:7b (same
+# Qwen-VL lineage already proven on the Runpod backend, but 7B's ~5-9GB real
+# runtime footprint leaves uncomfortably little headroom on this machine's
+# real hardware - confirmed via sysctl/system_profiler: Mac mini, Apple M4,
+# 16GB unified memory) and over llava:7b (older architecture, no longer the
+# best fit now that Ollama has first-class Qwen3-VL support).
+#
+# Specifically the "-instruct" tag, NOT the bare "qwen3-vl:4b" tag used
+# originally - real root cause found and verified empirically: the bare "4b"
+# tag's Modelfile (`ollama show qwen3-vl:4b --modelfile`) sets
+# `RENDERER/PARSER qwen3-vl-thinking`, meaning it ALWAYS generates a
+# `<think>...</think>` reasoning block regardless of the `think: false`
+# request option or a "/no_think" prompt directive - tested directly: even a
+# trivial "say hello" prompt produced 193 real eval tokens of genuine
+# reasoning in the `thinking` field with both suppression attempts in place.
+# This isn't "probabilistic non-compliance" as initially suspected, it's
+# architectural - Ollama's library ships separate "-thinking" and
+# "-instruct" tags per size specifically because a request-time flag can't
+# reliably override a model built around always reasoning first. Verified
+# the "-instruct" tag has NO `thinking` field in its response at all (tested
+# directly) - a real, deterministic fix instead of trying to suppress
+# thinking after the fact. Override via OLLAMA_JUDGE_MODEL if a different
+# local model fits better in practice.
 _OLLAMA_API_BASE = os.environ.get("OLLAMA_API_BASE", "http://localhost:11434")
-_OLLAMA_JUDGE_MODEL = os.environ.get("OLLAMA_JUDGE_MODEL", "qwen3-vl:4b")
+_OLLAMA_JUDGE_MODEL = os.environ.get("OLLAMA_JUDGE_MODEL", "qwen3-vl:4b-instruct")
 
 # Ollama's default context window (4096 tokens) is too small for a multi-frame
 # judge request - must match EXACTLY between the preload call and every real
@@ -100,44 +112,46 @@ _RUNPOD_API_BASE = "https://api.runpod.ai/v2"
 _RUNPOD_POLL_INTERVAL_S = 3.0
 _RUNPOD_POLL_TIMEOUT_S = 300.0  # real measured cold start: 189s delay + ~1s exec (see docstring below)
 
-# Frame-selection tuning. Sized down from the original (baseline=10, top_k=5,
-# max_total=25) using REAL measured timing on this machine (Mac mini, Apple
-# M4, 16GB unified memory, qwen3-vl:4b via Ollama), not a guess: a live
-# 15-frame request spent 87.7s just on prompt processing (image encoding +
-# context building) and was still only 85% done when it hit the inactivity
-# timeout - i.e. ~16,470 prompt tokens for 15 frames (~1,098 tokens/frame) at
-# a measured ~159.6 tokens/sec prompt-eval rate. Ollama's public streaming API
-# emits nothing during this phase, so more frames directly means more
-# unmonitored silent wait before generation even starts. Target: keep worst-
-# case prompt-processing time comfortably under 60s, which at the measured
-# per-frame/per-second rates works out to ~8-9 frames - rounded down to 8 for
-# margin. Re-tune once real perturbation-induced-failure accuracy data (not
-# just timing) is available to check whether 8 frames is still enough
-# coverage, separately from this latency-driven cap.
-BASELINE_FRAME_COUNT = 5  # evenly-spaced frames across the whole episode, for general coverage
-TOP_PERTURBATION_FRAMES = 3  # highest-realized-perturbation-magnitude frames to zoom in on
-PERTURBATION_CONTEXT_WINDOW = 1  # also include this many frames before/after each top-perturbation frame
-MAX_TOTAL_JUDGE_FRAMES = 8  # hard cap on total frames sent to the judge per episode (cost/latency)
+# Frame-selection strategy, redesigned around what the rubric actually needs
+# to see rather than generic uniform coverage (see vlm_judge_rules.md): most
+# criteria - gripper empty, object upright, no drop-and-abandon - are END-
+# STATE checks that only need the final frame(s). "Task completion" itself
+# needs a START frame too, to compare against (you can't tell an object
+# "moved from A to B" by only looking at the end). The one thing that
+# genuinely benefits from a middle frame is catching a transient collision or
+# a perturbation-induced stumble that happened to recover by luck before the
+# end - real but lower-priority, kept as a small safety net rather than the
+# main sampling strategy. This both concentrates frames on what the rubric
+# needs (likely improving accuracy) and reduces real total frame count below
+# the previous 8-frame baseline-evenly-spaced-across-the-whole-episode
+# approach, which directly shrinks prompt-processing time and therefore
+# timeout exposure (see _OLLAMA_SECONDS_PER_FRAME_ESTIMATE below) as a side
+# benefit, not just an accuracy change.
+START_FRAME_COUNT = 1  # the episode's start - needed to judge "did it actually move"
+END_FRAME_COUNT = 3  # the episode's last few frames - covers gripper/upright/drop-abandon checks
+# with a little robustness against the single last frame happening to be a
+# transient motion-blur moment right as the gripper releases
+MIDDLE_PERTURBATION_FRAMES = 2  # highest-realized-perturbation-magnitude frames from the middle, as a collision/stumble safety net
+MAX_TOTAL_JUDGE_FRAMES = 6  # hard cap - lower than before since this strategy needs fewer frames to cover the same rubric
 
 
 def select_judge_frame_indices(
     num_frames: int,
     perturbation_magnitudes: Optional[list] = None,
-    baseline_count: int = BASELINE_FRAME_COUNT,
-    top_k: int = TOP_PERTURBATION_FRAMES,
-    context_window: int = PERTURBATION_CONTEXT_WINDOW,
+    start_count: int = START_FRAME_COUNT,
+    end_count: int = END_FRAME_COUNT,
+    middle_top_k: int = MIDDLE_PERTURBATION_FRAMES,
     max_total: int = MAX_TOTAL_JUDGE_FRAMES,
 ) -> list:
-    """Pick frame indices to send to the judge: `baseline_count` evenly-spaced
-    frames for general coverage of the whole episode, PLUS - if per-step
-    realized perturbation magnitudes are known - the `top_k` highest-magnitude
-    frames (each with `context_window` frames of padding before/after), so a
-    brief mid-episode failure (a drop-and-recatch, a near-miss that resolves by
-    luck) that uniform sampling alone could land between samples and miss
-    entirely is still likely to get a frame near it. Capped at `max_total`
-    frames total for cost/latency; if the union would exceed that, the
-    perturbation-focused frames are kept in full and the baseline set is
-    thinned to fit the remaining budget.
+    """Pick frame indices to send to the judge: `start_count` frames from the
+    very start (for "did it actually move" comparison), `end_count` frames
+    from the very end (covers the end-state rubric checks - this also
+    guarantees the true final frame is always included, unlike an evenly-
+    spaced baseline that could drop it when competing for a small budget),
+    plus - if per-step realized perturbation magnitudes are known -
+    `middle_top_k` highest-magnitude frames from the remaining middle of the
+    episode, as a safety net for a transient mid-episode collision/stumble
+    that recovered by luck before the end. Capped at `max_total` total.
 
     `perturbation_magnitudes`, when given, must have length `num_frames` - one
     scalar per frame, the realized per-step perturbation (not the constant
@@ -146,42 +160,34 @@ def select_judge_frame_indices(
     """
     if num_frames <= 0:
         return []
-    if num_frames <= baseline_count:
-        baseline = list(range(num_frames))
-    else:
-        fractions = [i / (baseline_count - 1) for i in range(baseline_count)] if baseline_count > 1 else [0.0]
-        baseline = sorted(set(int(round(f * (num_frames - 1))) for f in fractions))
+    if num_frames <= start_count + end_count:
+        return list(range(num_frames))
 
-    perturbation_focused = []  # built in priority order so it can be safely
-    # truncated below if it alone exceeds max_total (possible with
-    # well-separated perturbation spikes and a small max_total) - a plain set
-    # would lose that priority ordering.
-    seen = set()
-    if perturbation_magnitudes and len(perturbation_magnitudes) == num_frames and top_k > 0:
-        ranked = sorted(range(num_frames), key=lambda i: perturbation_magnitudes[i], reverse=True)
-        for idx in ranked[:top_k]:
-            for offset in range(-context_window, context_window + 1):
-                neighbor = idx + offset
-                if 0 <= neighbor < num_frames and neighbor not in seen:
-                    seen.add(neighbor)
-                    perturbation_focused.append(neighbor)
+    selected = set(range(min(start_count, num_frames)))
+    selected |= set(range(max(0, num_frames - end_count), num_frames))
 
-    # perturbation-focused frames alone can exceed max_total (e.g. several
-    # well-separated spikes with a small max_total) - truncate to the
-    # highest-priority ones rather than silently going over budget.
-    if len(perturbation_focused) > max_total:
-        perturbation_focused = perturbation_focused[:max_total]
-    perturbation_focused = set(perturbation_focused)
+    if perturbation_magnitudes and len(perturbation_magnitudes) == num_frames and middle_top_k > 0:
+        middle_candidates = [i for i in range(num_frames) if i not in selected]
+        ranked = sorted(middle_candidates, key=lambda i: perturbation_magnitudes[i], reverse=True)
+        for idx in ranked[:middle_top_k]:
+            if len(selected) >= max_total:
+                break
+            selected.add(idx)
 
-    combined = set(baseline) | perturbation_focused
-    if len(combined) <= max_total:
-        return sorted(combined)
+    if len(selected) > max_total:
+        # Over budget even before adding perturbation frames (tiny max_total) -
+        # keep the TRUE final frame (num_frames - 1) above everything else,
+        # since that's the one frame several rubric criteria absolutely need
+        # and must never be the one trimmed away; then the rest of the end
+        # frames closest-to-last first, then the start frame(s) last.
+        last_index = num_frames - 1
+        ordered = sorted(
+            selected,
+            key=lambda i: (0 if i == last_index else (1 if i >= num_frames - end_count else 2), -i),
+        )
+        selected = set(ordered[:max_total])
 
-    # Over budget: keep all perturbation-focused frames, thin the baseline to
-    # fill whatever's left.
-    remaining_budget = max(0, max_total - len(perturbation_focused))
-    thinned_baseline = baseline[:: max(1, len(baseline) // max(1, remaining_budget))][:remaining_budget]
-    return sorted(perturbation_focused | set(thinned_baseline))
+    return sorted(selected)
 
 
 def _frame_to_base64_jpeg(frame) -> str:
@@ -221,13 +227,14 @@ def _extract_rule_criterion_names(rules_text: str) -> list:
 
 
 def _build_judge_prompt_text(task_description: str, num_frames: int) -> str:
-    # Trailing "/no_think" is Qwen3's own documented chat-template directive to
-    # suppress its extended thinking mode - verified empirically necessary:
-    # Ollama's generic "think": false request option alone was NOT honored by
-    # this model (a real test still produced 4,081 tokens of rambling
-    # "thinking" and hit the length limit with NO answer at all,
-    # done_reason="length"). With "/no_think" added to the prompt text itself,
-    # the same model produced a real answer in 345 total tokens / 10.7s.
+    # NOTE on thinking suppression: this used to need a trailing "/no_think"
+    # directive here, because the original "qwen3-vl:4b" tag ALWAYS reasons
+    # first regardless of request-time flags (see _OLLAMA_JUDGE_MODEL's real
+    # root-cause comment - it's a different model build via Ollama's
+    # "-thinking" tag, not a flag that was being ignored). Switching to the
+    # "qwen3-vl:4b-instruct" tag fixes this at the source - verified directly,
+    # that tag's responses have no `thinking` field at all - so no prompt-side
+    # workaround is needed here any more.
     rules_text = _load_judge_rules()
     rules_block = f"\n{rules_text}\n\n" if rules_text else "\n"
     criterion_names = _extract_rule_criterion_names(rules_text)
@@ -235,10 +242,8 @@ def _build_judge_prompt_text(task_description: str, num_frames: int) -> str:
     # Asking for a second, structured section (after the required one-line
     # verdict) so a per-criterion checklist can be displayed in the terminal -
     # kept as a strict, exact-name-echo format rather than free-form JSON/etc.
-    # specifically because this model was already shown (see the /no_think
-    # comment above) to follow a simple, explicit line-format instruction
-    # reliably, and criteria names are pulled from the rules file itself so
-    # this never drifts out of sync with what's actually in it.
+    # since criteria names are pulled from the rules file itself, so this
+    # never drifts out of sync with what's actually in it.
     checklist_instruction = ""
     if criterion_names:
         criteria_lines = "\n".join(f"- {name}" for name in criterion_names)
@@ -257,8 +262,10 @@ def _build_judge_prompt_text(task_description: str, num_frames: int) -> str:
         f"(right side). The task involves picking an object and moving it between "
         f"these zones as described.\n"
         f"{rules_block}"
-        f"Below are {num_frames} frames sampled across the episode, in "
-        f"chronological order (first frame = episode start, last frame = episode end).\n\n"
+        f"Below are {num_frames} frames from the episode, in chronological order: "
+        f"starting frame(s) first, then (if a perturbation-notable moment occurred "
+        f"mid-episode) one from the middle, then the final frame(s) showing the "
+        f"episode's end state last.\n\n"
         f"Look at how the scene changes from the first frame to the last. Judge "
         f"whether this episode shows a VALID, successful completion of the task "
         f"(the object was actually grasped, moved in the correct direction, and "
@@ -274,8 +281,7 @@ def _build_judge_prompt_text(task_description: str, num_frames: int) -> str:
         f"VALID - the object moved from the left zone to the right zone and the "
         f"gripper is empty at the end.\n"
         f"{checklist_instruction}"
-        f"Do not include anything else in your response.\n\n"
-        f"/no_think"
+        f"Do not include anything else in your response."
     )
 
 
@@ -538,9 +544,10 @@ def _judge_episode_ollama(frames: list, task_description: str) -> JudgeResult:
             }
         ],
         "stream": True,
-        "think": False,  # belt-and-suspenders alongside the prompt's own "/no_think" -
-        # see _build_judge_prompt_text()'s comment for why the prompt directive is the
-        # one actually relied on (this request option alone was tested and not honored)
+        "think": False,  # harmless no-op on the "-instruct" tag (it has no thinking
+        # mode to disable); kept in case OLLAMA_JUDGE_MODEL is overridden to a
+        # "-thinking" tag, where this request option genuinely has no effect either
+        # (see _OLLAMA_JUDGE_MODEL's comment) - the real fix is the model tag itself.
         "options": {"num_ctx": _OLLAMA_NUM_CTX},
         "keep_alive": _OLLAMA_KEEP_ALIVE,
     }

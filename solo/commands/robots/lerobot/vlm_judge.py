@@ -193,27 +193,58 @@ def _frame_to_base64_jpeg(frame) -> str:
     return base64.b64encode(buffer.getvalue()).decode("utf-8")
 
 
+# User-editable judging criteria, loaded fresh per call (not cached) so edits
+# take effect on the next judge call with no restart needed. Path is next to
+# this file, not under ~/.solo - this is judging logic shipped with the repo,
+# not per-user runtime config, but still meant to be hand-edited in place.
+_JUDGE_RULES_PATH = os.path.join(os.path.dirname(__file__), "vlm_judge_rules.md")
+
+
+def _load_judge_rules() -> str:
+    """Best-effort: missing/unreadable rules file degrades to task-description-
+    only judging rather than failing the whole call."""
+    try:
+        with open(_JUDGE_RULES_PATH, "r") as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+
+
 def _build_judge_prompt_text(task_description: str, num_frames: int) -> str:
+    # Trailing "/no_think" is Qwen3's own documented chat-template directive to
+    # suppress its extended thinking mode - verified empirically necessary:
+    # Ollama's generic "think": false request option alone was NOT honored by
+    # this model (a real test still produced 4,081 tokens of rambling
+    # "thinking" and hit the length limit with NO answer at all,
+    # done_reason="length"). With "/no_think" added to the prompt text itself,
+    # the same model produced a real answer in 345 total tokens / 10.7s.
+    rules_text = _load_judge_rules()
+    rules_block = f"\n{rules_text}\n\n" if rules_text else "\n"
     return (
         f"You are judging a robot arm demonstration recorded for training data. "
         f"The task description is: \"{task_description}\".\n\n"
         f"The robot arm is set up with two zones on a table, A (left side) and B "
         f"(right side). The task involves picking an object and moving it between "
-        f"these zones as described.\n\n"
+        f"these zones as described.\n"
+        f"{rules_block}"
         f"Below are {num_frames} frames sampled across the episode, in "
         f"chronological order (first frame = episode start, last frame = episode end).\n\n"
         f"Look at how the scene changes from the first frame to the last. Judge "
         f"whether this episode shows a VALID, successful completion of the task "
         f"(the object was actually grasped, moved in the correct direction, and "
-        f"released at the target) versus an INVALID one (dropped object, missed "
-        f"grasp, wrong direction, or other failure - these can happen when the "
+        f"released at the target, with none of the house rules above violated) "
+        f"versus an INVALID one (dropped object, missed grasp, wrong direction, a "
+        f"house-rule violation, or other failure - these can happen when the "
         f"recorded actions have been perturbed with random noise for data "
         f"augmentation).\n\n"
         f"Respond with EXACTLY one line starting with \"VALID\" or \"INVALID\", "
-        f"followed by a dash and a one-sentence reason. Example:\n"
+        f"followed by a dash and a ONE-SENTENCE reason - do not explain your "
+        f"reasoning at length, a single short sentence is all that's needed. "
+        f"Example:\n"
         f"VALID - the object moved from the left zone to the right zone and the "
         f"gripper is empty at the end.\n"
-        f"Do not include anything else in your response."
+        f"Do not include anything else in your response.\n\n"
+        f"/no_think"
     )
 
 
@@ -428,6 +459,9 @@ def _judge_episode_ollama(frames: list, task_description: str) -> JudgeResult:
             }
         ],
         "stream": True,
+        "think": False,  # belt-and-suspenders alongside the prompt's own "/no_think" -
+        # see _build_judge_prompt_text()'s comment for why the prompt directive is the
+        # one actually relied on (this request option alone was tested and not honored)
         "options": {"num_ctx": _OLLAMA_NUM_CTX},
         "keep_alive": _OLLAMA_KEEP_ALIVE,
     }
@@ -447,8 +481,11 @@ def _judge_episode_ollama(frames: list, task_description: str) -> JudgeResult:
 
         content_parts = []
         final_chunk = None
-        thinking_started = False
-        content_started = False
+        # Deliberately NOT echoing msg["thinking"] live (an earlier version did)
+        # - the user found a full live thinking-stream too noisy and asked for
+        # a single final summary instead. The progress bar alone remains as the
+        # "is it still working" signal during generation; the real verdict+
+        # reason prints once, after the call completes, via _parse_verdict().
         with tqdm(total=None, desc="Generating", unit="chunk") as bar:
             for line in resp.iter_lines():
                 if not line:
@@ -460,25 +497,12 @@ def _judge_episode_ollama(frames: list, task_description: str) -> JudgeResult:
                     tail_proc = None
                 chunk = json.loads(line)
                 bar.update(1)
-                msg = chunk.get("message", {})
-                thinking_delta = msg.get("thinking") or ""
-                content_delta = msg.get("content") or ""
-                if thinking_delta:
-                    if not thinking_started:
-                        tqdm.write("🧠 thinking: ", end="")
-                        thinking_started = True
-                    tqdm.write(thinking_delta, end="")
+                content_delta = chunk.get("message", {}).get("content") or ""
                 if content_delta:
-                    if not content_started:
-                        tqdm.write("\n💬 answer: ", end="")
-                        content_started = True
-                    tqdm.write(content_delta, end="")
                     content_parts.append(content_delta)
                 if chunk.get("done"):
                     final_chunk = chunk
                     break
-        if thinking_started or content_started:
-            tqdm.write("")  # final newline after the live-streamed text
 
         if final_chunk is not None:
             typer.echo(f"📊 {_extract_real_stats(final_chunk)}")

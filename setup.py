@@ -33,6 +33,7 @@ setup(
         "num2words",
         "websockets",
         "anthropic",
+        "gradio",
     ],
     extras_require={
         "dev": ["pytest", "black", "isort"],

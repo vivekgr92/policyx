@@ -250,18 +250,15 @@ def replay_mode(config: dict, auto_use: bool = False, replay_options: dict = Non
             episode_raw = Prompt.ask(
                 "Enter episode(s) to replay (number, '0,2,5', '0-10', or 'all')", default="0"
             )
-            loop = False
             looks_like_multiple = "," in episode_raw or "-" in episode_raw or episode_raw.strip().lower() in ("all", "*")
-            if looks_like_multiple:
-                loop = Confirm.ask(
-                    "Loop mode: alternate playback between the selected episodes each cycle "
-                    "(e.g. play A→B, then B→A, then A→B again, ...) instead of finishing one "
-                    "episode's repeats before moving to the next?",
-                    default=False,
-                )
+            # A multi-episode selection (e.g. "2,3") already implies an order to
+            # play them in, so repeating it means repeating that whole sequence
+            # (2,3,2,3,...), not finishing all repeats of episode 2 before moving
+            # to episode 3 - no separate yes/no question needed for this.
+            loop = looks_like_multiple
             repeat_count = max(1, int(Prompt.ask(
-                "How many times to replay each selected episode?" if not loop else
-                "How many alternating cycles through the selected episodes?",
+                "How many times to repeat this sequence of episodes?" if loop else
+                "How many times to replay each selected episode?",
                 default="1",
             )))
             perturb = float(Prompt.ask(

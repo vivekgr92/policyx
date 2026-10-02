@@ -8,7 +8,7 @@ completion of that task - used to filter out perturbation-induced failures
 training dataset.
 
 Default backend is a self-hosted Qwen2.5-VL-7B-Instruct model on Runpod
-serverless (endpoint "qwen-vlm-judge", id f05k388tgebmvj, GPU pool ADA_24 /
+serverless (endpoint "qwen-vlm-judge", id lt8yd7ssvip3y9, GPU pool ADA_24 /
 RTX 4090 at $1.10/hr serverless, deployed via the official
 runpod-workers/worker-vllm Hub image) - chosen over a frontier API because
 this judge call runs on every perturbed replay episode, potentially thousands
@@ -43,7 +43,7 @@ DEFAULT_JUDGE_TASK_DESCRIPTION = "Pick cup and place"
 _JUDGE_MODEL = "claude-sonnet-5"
 
 # Runpod serverless backend (default) - see module docstring for cost/rationale.
-RUNPOD_JUDGE_ENDPOINT_ID = os.environ.get("RUNPOD_JUDGE_ENDPOINT_ID", "f05k388tgebmvj")
+RUNPOD_JUDGE_ENDPOINT_ID = os.environ.get("RUNPOD_JUDGE_ENDPOINT_ID", "lt8yd7ssvip3y9")
 _RUNPOD_JUDGE_MODEL = "Qwen/Qwen2.5-VL-7B-Instruct"
 _RUNPOD_API_BASE = "https://api.runpod.ai/v2"
 _RUNPOD_POLL_INTERVAL_S = 3.0
@@ -256,7 +256,12 @@ def _judge_episode_runpod(frames: list, task_description: str) -> Optional[bool]
             f"{_RUNPOD_API_BASE}/{RUNPOD_JUDGE_ENDPOINT_ID}/runsync",
             json=payload,
             headers=headers,
-            timeout=60,
+            # Runpod holds a /runsync request open server-side for a while before
+            # falling back to an IN_PROGRESS/IN_QUEUE response for the poll loop
+            # below to pick up - 60s was shorter than that hold, so a real cold
+            # start (measured ~190s) killed the connection locally before Runpod
+            # ever got to respond, never reaching the poll loop at all.
+            timeout=100,
         )
         resp.raise_for_status()
         result = resp.json()

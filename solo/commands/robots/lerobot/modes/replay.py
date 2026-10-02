@@ -497,6 +497,19 @@ def replay_mode(config: dict, auto_use: bool = False, replay_options: dict = Non
         init_rerun(session_name="replay")
         rerun_active = True
 
+        # Resolved once up front (not per-episode) so both the per-episode
+        # rest-return (right after each episode, before the judge call - gives
+        # the arm a safe pose for the judge's potentially multi-minute wait
+        # instead of sitting wherever that episode's last frame left it) and
+        # the final end-of-session rest-return can reuse it.
+        home_limits = limits
+        if home_limits is None:
+            from solo.commands.robots.lerobot.deployx.safety import load_joint_limits
+            try:
+                home_limits = load_joint_limits(robot_type, follower_id)
+            except Exception as e:
+                typer.echo(f"⚠️  Could not load joint limits to return to rest position: {e}")
+
         if vlm_judge and os.environ.get("VLM_JUDGE_BACKEND", "ollama").strip().lower() == "ollama":
             from solo.commands.robots.lerobot.vlm_judge import preload_ollama_judge_model
             preload_ollama_judge_model()
@@ -589,6 +602,15 @@ def replay_mode(config: dict, auto_use: bool = False, replay_options: dict = Non
 
                         precise_sleep(1 / fps - (time.perf_counter() - start_t))
 
+                    # Move to rest BEFORE the (potentially multi-minute) judge
+                    # call, not after - otherwise the arm sits wherever this
+                    # episode's last frame happened to leave it for the whole
+                    # judging wait. Scoped to vlm_judge sessions only - a
+                    # plain replay (no judge) has no long wait to protect
+                    # against here, so behavior for it is unchanged.
+                    if vlm_judge and home_limits is not None:
+                        _move_to_rest_position(robot, home_limits, robot_action_processor, fps)
+
                     if new_dataset is not None:
                         keep_episode = True
                         episode_reason = None
@@ -629,13 +651,11 @@ def replay_mode(config: dict, auto_use: bool = False, replay_options: dict = Non
                             new_dataset.clear_episode_buffer()
                             typer.echo(f"🗑️  Discarded replayed {label} - {episode_reason}")
 
-                home_limits = limits
-                if home_limits is None:
-                    from solo.commands.robots.lerobot.deployx.safety import load_joint_limits
-                    try:
-                        home_limits = load_joint_limits(robot_type, follower_id)
-                    except Exception as e:
-                        typer.echo(f"⚠️  Could not load joint limits to return to rest position: {e}")
+                # Safety net: with vlm_judge on, every episode already returned
+                # to rest after itself above, so this is normally a cheap
+                # near-no-op; kept unconditionally (not just for vlm_judge)
+                # since it's the pre-existing end-of-session behavior for
+                # plain replay too, and removing it isn't this fix's concern.
                 if home_limits is not None:
                     _move_to_rest_position(robot, home_limits, robot_action_processor, fps)
 

@@ -7,23 +7,31 @@ completion of that task - used to filter out perturbation-induced failures
 (dropped object, missed grasp, wrong direction) before they're saved into a
 training dataset.
 
-Default backend is a self-hosted Qwen2.5-VL-7B-Instruct model on Runpod
-serverless (endpoint "qwen-vlm-judge", id lt8yd7ssvip3y9, GPU pool ADA_24 /
-RTX 4090 at $1.10/hr serverless, deployed via the official
-runpod-workers/worker-vllm Hub image) - chosen over a frontier API because
-this judge call runs on every perturbed replay episode, potentially thousands
-of times during a real data-collection campaign, where per-call frontier-API
-token costs add up fast. The endpoint is true scale-to-zero (workersMin=0,
-idleTimeout=120s): no cost at all between data-collection sessions, since a
-single --loop session's back-to-back episodes keep one worker warm the whole
-session, and it only scales down after 120s of no requests (i.e. once the
-session actually ends). The real tradeoff is a cold start on the first call
-of each new session - see _judge_episode_runpod()'s docstring for the
-measured real numbers.
+Default backend is now a local Ollama server on the Mac mini itself (set
+VLM_JUDGE_BACKEND=ollama, or just leave it unset) - zero per-call cost, no
+network round trip, no cold-start-vs-idle-cost tradeoff to manage, per an
+explicit request to stop spending time/money on Runpod for this while it's
+still being tested. Requires Ollama installed (https://ollama.com) and the
+judge model pulled locally (`ollama pull llava:7b` by default - see
+OLLAMA_JUDGE_MODEL below to use a different one). See
+_judge_episode_ollama()'s docstring for the model choice rationale and real
+caveats on this hardware.
 
-The Anthropic Claude backend from the original prototype is kept as an
-optional fallback (set VLM_JUDGE_BACKEND=anthropic) in case Runpod capacity/
-cost tradeoffs change.
+Runpod serverless (set VLM_JUDGE_BACKEND=runpod) remains available as an
+explicit opt-in for later - a self-hosted Qwen2.5-VL-7B-Instruct model
+(endpoint "qwen-vlm-judge", id lt8yd7ssvip3y9, GPU pool ADA_24 / RTX 4090 at
+$1.10/hr serverless, deployed via the official runpod-workers/worker-vllm Hub
+image), originally chosen over a frontier API because this judge call runs on
+every perturbed replay episode, potentially thousands of times during a real
+data-collection campaign, where per-call frontier-API token costs add up
+fast. The endpoint is true scale-to-zero (workersMin=0, idleTimeout=120s): no
+cost between data-collection sessions, but a real cold start on the first
+call of each new session - see _judge_episode_runpod()'s docstring for the
+measured real numbers. Worth revisiting once local quality/speed is proven
+insufficient for real use.
+
+The Anthropic Claude backend from the original prototype is kept as a second
+fallback (set VLM_JUDGE_BACKEND=anthropic).
 """
 
 import base64
@@ -42,7 +50,18 @@ from solo.config import CONFIG_PATH
 DEFAULT_JUDGE_TASK_DESCRIPTION = "Pick cup and place"
 _JUDGE_MODEL = "claude-sonnet-5"
 
-# Runpod serverless backend (default) - see module docstring for cost/rationale.
+# Local Ollama backend (default) - see module docstring for cost/rationale.
+# llava:7b chosen over moondream (1.8B, faster but weaker multi-image
+# reasoning) for this judgment task's need to compare a sequence of frames
+# and make a nuanced valid/invalid call, and over llama3.2-vision (11B,
+# stronger but noticeably slower with no discrete GPU) for speed - a real
+# tradeoff, not verified against real failure-case data on this exact
+# hardware yet. Override via OLLAMA_JUDGE_MODEL if a different local model
+# fits better in practice.
+_OLLAMA_API_BASE = os.environ.get("OLLAMA_API_BASE", "http://localhost:11434")
+_OLLAMA_JUDGE_MODEL = os.environ.get("OLLAMA_JUDGE_MODEL", "llava:7b")
+
+# Runpod serverless backend (opt-in) - see module docstring for cost/rationale.
 RUNPOD_JUDGE_ENDPOINT_ID = os.environ.get("RUNPOD_JUDGE_ENDPOINT_ID", "lt8yd7ssvip3y9")
 _RUNPOD_JUDGE_MODEL = "Qwen/Qwen2.5-VL-7B-Instruct"
 _RUNPOD_API_BASE = "https://api.runpod.ai/v2"
@@ -199,6 +218,59 @@ def get_runpod_api_key() -> str:
     return get_api_key()
 
 
+def _judge_episode_ollama(frames: list, task_description: str) -> Optional[bool]:
+    """
+    Judge via a local Ollama server (https://ollama.com) running a
+    vision-capable model directly on this machine - no network round trip, no
+    per-call cost, no cold-start-vs-idle-cost tradeoff. Requires Ollama
+    installed and running (`ollama serve`, or the menu-bar app which runs it
+    automatically) and the model already pulled (`ollama pull llava:7b`, or
+    whatever OLLAMA_JUDGE_MODEL is set to).
+
+    Honest caveat, not yet measured on real hardware: this was implemented
+    and wired up but could not be live-tested in this environment - Ollama
+    itself is not installed here (`which ollama` found nothing, and there's
+    no Homebrew either to install it non-interactively). Real speed/quality
+    on an actual Mac mini (no discrete GPU, Apple Silicon unified memory via
+    Metal) is unverified; expect noticeably slower inference than a GPU
+    backend, and unknown judgment accuracy until checked against real
+    perturbation-induced failures the same way the Runpod path was checked.
+    """
+    if not frames:
+        typer.echo("⚠️  VLM judge: no frames to judge - could not verify.")
+        return None
+
+    images_b64 = [_frame_to_base64_jpeg(frame) for frame in frames]
+    payload = {
+        "model": _OLLAMA_JUDGE_MODEL,
+        "messages": [
+            {
+                "role": "user",
+                "content": _build_judge_prompt_text(task_description, len(frames)),
+                "images": images_b64,
+            }
+        ],
+        "stream": False,
+    }
+
+    try:
+        resp = requests.post(f"{_OLLAMA_API_BASE}/api/chat", json=payload, timeout=180)
+        resp.raise_for_status()
+        result = resp.json()
+        verdict_text = result["message"]["content"]
+        return _parse_verdict(verdict_text)
+    except requests.exceptions.ConnectionError:
+        typer.echo(
+            f"⚠️  VLM judge: could not reach Ollama at {_OLLAMA_API_BASE} - is it "
+            f"installed and running? (https://ollama.com, then "
+            f"`ollama pull {_OLLAMA_JUDGE_MODEL}`)"
+        )
+        return None
+    except Exception as e:
+        typer.echo(f"⚠️  VLM judge: Ollama call failed ({e}).")
+        return None
+
+
 def _judge_episode_runpod(frames: list, task_description: str) -> Optional[bool]:
     """
     Judge via a self-hosted Qwen2.5-VL-7B-Instruct model on Runpod serverless
@@ -352,10 +424,13 @@ def judge_episode(frames: list, task_description: str = DEFAULT_JUDGE_TASK_DESCR
     episode that cannot be verified is treated as not trustworthy enough to
     keep, not defaulted to "probably fine."
 
-    Backend is Runpod serverless (Qwen2.5-VL) by default; set
-    VLM_JUDGE_BACKEND=anthropic to use the Claude fallback instead.
+    Backend is local Ollama by default (free, no cold start, runs on this
+    machine); set VLM_JUDGE_BACKEND=runpod for the Qwen2.5-VL Runpod
+    serverless path, or VLM_JUDGE_BACKEND=anthropic for the Claude fallback.
     """
-    backend = os.environ.get("VLM_JUDGE_BACKEND", "runpod").strip().lower()
+    backend = os.environ.get("VLM_JUDGE_BACKEND", "ollama").strip().lower()
     if backend == "anthropic":
         return _judge_episode_anthropic(frames, task_description)
-    return _judge_episode_runpod(frames, task_description)
+    if backend == "runpod":
+        return _judge_episode_runpod(frames, task_description)
+    return _judge_episode_ollama(frames, task_description)

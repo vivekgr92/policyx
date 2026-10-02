@@ -62,6 +62,33 @@ def _parse_episode_selection(value, total_episodes: int) -> list:
     return episodes
 
 
+def _move_to_rest_position(robot, limits, robot_action_processor, fps: int, duration_s: float = 2.0) -> None:
+    """Smoothly interpolate the follower arm to the midpoint of each joint's
+    calibrated safe range over `duration_s`, instead of leaving the arm wherever
+    the last replayed frame happened to stop (often an awkward mid-motion pose)
+    and then abruptly cutting power on disconnect."""
+    from lerobot.utils.robot_utils import precise_sleep
+
+    obs = robot.get_observation()
+    positions = {key[: -len(".pos")]: float(value) for key, value in obs.items() if key.endswith(".pos")}
+    if not all(name in positions for name in limits.names):
+        return  # can't safely interpolate without a full current reading
+
+    start = [positions[name] for name in limits.names]
+    target = [(limits.position_min[i] + limits.position_max[i]) / 2 for i in range(len(limits.names))]
+
+    typer.echo("🏠 Returning to rest position...")
+    num_steps = max(1, int(duration_s * fps))
+    for step in range(1, num_steps + 1):
+        start_t = time.perf_counter()
+        t = step / num_steps
+        action = {f"{name}.pos": start[i] + (target[i] - start[i]) * t for i, name in enumerate(limits.names)}
+        obs = robot.get_observation()
+        processed_action = robot_action_processor((action, obs))
+        robot.send_action(processed_action)
+        precise_sleep(1 / fps - (time.perf_counter() - start_t))
+
+
 def _dataset_already_exists(repo_id: str) -> bool:
     """Check whether repo_id already has a (locally cached) dataset on disk."""
     from solo.commands.robots.lerobot.dataset import check_dataset_exists
@@ -479,6 +506,16 @@ def replay_mode(config: dict, auto_use: bool = False, replay_options: dict = Non
                     if new_dataset is not None:
                         new_dataset.save_episode()
                         typer.echo(f"💾 Saved replayed {label} as a new episode in '{save_replay_as}'")
+
+                home_limits = limits
+                if home_limits is None:
+                    from solo.commands.robots.lerobot.deployx.safety import load_joint_limits
+                    try:
+                        home_limits = load_joint_limits(robot_type, follower_id)
+                    except Exception as e:
+                        typer.echo(f"⚠️  Could not load joint limits to return to rest position: {e}")
+                if home_limits is not None:
+                    _move_to_rest_position(robot, home_limits, robot_action_processor, fps)
 
                 robot.disconnect()
                 typer.echo(f"\n✅ Replay completed! ({len(episodes)} episode(s) x {repeat_count} repeat(s))")

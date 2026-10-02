@@ -38,6 +38,7 @@ in use - local Ollama now, Runpod later.)
 import base64
 import json
 import os
+import re
 import subprocess
 import time
 from dataclasses import dataclass
@@ -210,6 +211,15 @@ def _load_judge_rules() -> str:
         return ""
 
 
+def _extract_rule_criterion_names(rules_text: str) -> list:
+    """Pull criterion names straight out of the rules file's own bold
+    (**Name**) headers, so editing vlm_judge_rules.md to add/remove/rename a
+    criterion automatically updates both what the prompt asks the model to
+    check and what the checklist parser below looks for - no separate
+    hardcoded criteria list to drift out of sync with the user-editable file."""
+    return re.findall(r"\*\*(.+?)\*\*", rules_text)
+
+
 def _build_judge_prompt_text(task_description: str, num_frames: int) -> str:
     # Trailing "/no_think" is Qwen3's own documented chat-template directive to
     # suppress its extended thinking mode - verified empirically necessary:
@@ -220,6 +230,26 @@ def _build_judge_prompt_text(task_description: str, num_frames: int) -> str:
     # the same model produced a real answer in 345 total tokens / 10.7s.
     rules_text = _load_judge_rules()
     rules_block = f"\n{rules_text}\n\n" if rules_text else "\n"
+    criterion_names = _extract_rule_criterion_names(rules_text)
+
+    # Asking for a second, structured section (after the required one-line
+    # verdict) so a per-criterion checklist can be displayed in the terminal -
+    # kept as a strict, exact-name-echo format rather than free-form JSON/etc.
+    # specifically because this model was already shown (see the /no_think
+    # comment above) to follow a simple, explicit line-format instruction
+    # reliably, and criteria names are pulled from the rules file itself so
+    # this never drifts out of sync with what's actually in it.
+    checklist_instruction = ""
+    if criterion_names:
+        criteria_lines = "\n".join(f"- {name}" for name in criterion_names)
+        checklist_instruction = (
+            f"\nAfter that line, add a line \"CHECKLIST:\" followed by one line per "
+            f"criterion below, each EXACTLY in the form \"<criterion name>: PASS\" "
+            f"or \"<criterion name>: FAIL - <brief reason>\" - use the exact "
+            f"criterion names given below, do not reword or abbreviate them:\n"
+            f"{criteria_lines}\n"
+        )
+
     return (
         f"You are judging a robot arm demonstration recorded for training data. "
         f"The task description is: \"{task_description}\".\n\n"
@@ -243,25 +273,74 @@ def _build_judge_prompt_text(task_description: str, num_frames: int) -> str:
         f"Example:\n"
         f"VALID - the object moved from the left zone to the right zone and the "
         f"gripper is empty at the end.\n"
+        f"{checklist_instruction}"
         f"Do not include anything else in your response.\n\n"
         f"/no_think"
     )
 
 
+def _parse_checklist(verdict_text: str, criterion_names: list) -> Optional[list]:
+    """Best-effort parse of the model's "CHECKLIST:" section into a list of
+    (name, passed, reason) tuples, matched against the real criterion names
+    from vlm_judge_rules.md (not a hardcoded list - see
+    _extract_rule_criterion_names). Returns None (not a partial/garbled list)
+    if there's no criteria to check, no CHECKLIST section in the response at
+    all, or not one criterion name could be matched - callers should fall back
+    to showing just the overall verdict+reason in that case, same as if this
+    feature didn't exist, rather than render a confusing incomplete checklist."""
+    if not criterion_names:
+        return None
+    marker_idx = verdict_text.upper().find("CHECKLIST")
+    if marker_idx == -1:
+        return None
+    checklist_block = verdict_text[marker_idx:]
+
+    results = []
+    for name in criterion_names:
+        match = re.search(
+            re.escape(name) + r"\s*:\s*(PASS|FAIL)\b(?:\s*-\s*(.*))?",
+            checklist_block,
+            re.IGNORECASE,
+        )
+        if match:
+            passed = match.group(1).upper() == "PASS"
+            reason = (match.group(2) or "").strip()
+            results.append((name, passed, reason))
+    return results if results else None
+
+
+def _render_checklist(checklist: list) -> None:
+    typer.echo("📋 Rubric checklist:")
+    for name, passed, reason in checklist:
+        icon = "✅" if passed else "❌"
+        suffix = f" - {reason}" if (not passed and reason) else ""
+        typer.echo(f"   {icon} {name}{suffix}")
+
+
 def _parse_verdict(verdict_text: str) -> JudgeResult:
     """Parse a model response of the form "VALID - <reason>" / "INVALID -
-    <reason>" into a JudgeResult, preserving the model's actual stated reason
-    rather than discarding it."""
-    typer.echo(f"🧑‍⚖️  VLM judge: {verdict_text}")
+    <reason>" (optionally followed by a "CHECKLIST:" section - see
+    _parse_checklist) into a JudgeResult, preserving the model's actual stated
+    reason rather than discarding it. Only the first line is echoed/parsed as
+    the verdict+reason - the checklist section, when present, is rendered
+    separately by _render_checklist() so the main verdict line stays exactly
+    as short as before this feature existed."""
     stripped = verdict_text.strip()
-    upper = stripped.upper()
+    first_line = stripped.splitlines()[0] if stripped else stripped
+    typer.echo(f"🧑‍⚖️  VLM judge: {first_line}")
 
-    reason = stripped
-    if "-" in stripped:
-        _, _, after_dash = stripped.partition("-")
+    upper = first_line.upper()
+    reason = first_line
+    if "-" in first_line:
+        _, _, after_dash = first_line.partition("-")
         after_dash = after_dash.strip()
         if after_dash:
             reason = after_dash
+
+    criterion_names = _extract_rule_criterion_names(_load_judge_rules())
+    checklist = _parse_checklist(stripped, criterion_names)
+    if checklist:
+        _render_checklist(checklist)
 
     if upper.startswith("VALID"):
         return JudgeResult(True, reason)
@@ -621,7 +700,8 @@ def _judge_episode_runpod(frames: list, task_description: str) -> JudgeResult:
             "openai_input": {
                 "model": _RUNPOD_JUDGE_MODEL,
                 "messages": [{"role": "user", "content": content}],
-                "max_tokens": 200,
+                "max_tokens": 300,  # bumped from 200 to leave room for the
+                # per-criterion CHECKLIST section now also requested
             },
         }
     }

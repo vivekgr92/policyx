@@ -166,6 +166,9 @@ def replay_mode(config: dict, auto_use: bool = False, replay_options: dict = Non
         perturb = replay_options.get('perturb') or 0.0
         perturb_increment = replay_options.get('perturb_increment') or 0.0
         loop = bool(replay_options.get('loop') or False)
+        vlm_judge = bool(replay_options.get('vlm_judge') or False)
+        from solo.commands.robots.lerobot.vlm_judge import DEFAULT_JUDGE_TASK_DESCRIPTION
+        judge_task = replay_options.get('judge_task') or DEFAULT_JUDGE_TASK_DESCRIPTION
         camera_config = replay_options.get('camera_config')
         if camera_config is None:
             # No cameras passed on the CLI (there's no flag for that) - fall back
@@ -194,6 +197,9 @@ def replay_mode(config: dict, auto_use: bool = False, replay_options: dict = Non
             perturb = preconfigured.get('perturb') or 0.0
             perturb_increment = preconfigured.get('perturb_increment') or 0.0
             loop = bool(preconfigured.get('loop') or False)
+            vlm_judge = bool(preconfigured.get('vlm_judge') or False)
+            from solo.commands.robots.lerobot.vlm_judge import DEFAULT_JUDGE_TASK_DESCRIPTION
+            judge_task = preconfigured.get('judge_task') or DEFAULT_JUDGE_TASK_DESCRIPTION
             camera_config = preconfigured.get('camera_config')
         else:
             # Get robot config
@@ -275,6 +281,9 @@ def replay_mode(config: dict, auto_use: bool = False, replay_options: dict = Non
 
             save_replay_as = None
             save_replay_resume = False
+            vlm_judge = False
+            from solo.commands.robots.lerobot.vlm_judge import DEFAULT_JUDGE_TASK_DESCRIPTION
+            judge_task = DEFAULT_JUDGE_TASK_DESCRIPTION
             if Confirm.ask(
                 "\nAlso save this replay as new recorded episode(s) (with live camera capture) "
                 "for building up more training data?",
@@ -293,6 +302,17 @@ def replay_mode(config: dict, auto_use: bool = False, replay_options: dict = Non
                 else:
                     typer.echo(f"📼 Will create a new dataset '{save_replay_as}'")
 
+                vlm_judge = Confirm.ask(
+                    "Use a VLM judge to filter out invalid episodes (e.g. perturbation-induced "
+                    "failures) before saving them?",
+                    default=False,
+                )
+                if vlm_judge:
+                    judge_task = clean_ansi_codes(Prompt.ask(
+                        "Task description for the judge to evaluate against",
+                        default=DEFAULT_JUDGE_TASK_DESCRIPTION,
+                    ))
+
             from solo.commands.robots.lerobot.cameras import setup_cameras
             typer.echo("\n📷 Set up cameras for this replay:")
             camera_config = setup_cameras()
@@ -304,7 +324,8 @@ def replay_mode(config: dict, auto_use: bool = False, replay_options: dict = Non
                 'dataset_repo_id': dataset_repo_id, 'episode': episode_raw, 'fps': fps, 'play_sounds': play_sounds,
                 'save_replay_as': save_replay_as, 'camera_config': camera_config,
                 'save_replay_resume': save_replay_resume, 'repeat': repeat_count, 'perturb': perturb,
-                'perturb_increment': perturb_increment, 'loop': loop,
+                'perturb_increment': perturb_increment, 'loop': loop, 'vlm_judge': vlm_judge,
+                'judge_task': judge_task,
             })
 
     # Import lerobot components
@@ -380,7 +401,8 @@ def replay_mode(config: dict, auto_use: bool = False, replay_options: dict = Non
                 'dataset_repo_id': dataset_repo_id, 'episode': episode_raw, 'fps': fps, 'play_sounds': play_sounds,
                 'save_replay_as': save_replay_as, 'camera_config': camera_config,
                 'save_replay_resume': save_replay_resume, 'repeat': repeat_count, 'perturb': perturb,
-                'perturb_increment': perturb_increment, 'loop': loop,
+                'perturb_increment': perturb_increment, 'loop': loop, 'vlm_judge': vlm_judge,
+                'judge_task': judge_task,
             })
 
         task_description = None
@@ -500,6 +522,18 @@ def replay_mode(config: dict, auto_use: bool = False, replay_options: dict = Non
                     typer.echo(f"\n📊 Replaying {label} ({len(episode_frames)} frames)")
                     log_say("Replaying episode", play_sounds, blocking=True)
 
+                    # Only buffered when --vlm-judge is active, to avoid the
+                    # memory overhead otherwise - these hold the actual judge
+                    # input: one representative camera's raw frames plus the
+                    # realized (post-clamp) perturbation magnitude at each
+                    # step, which is NOT the same as effective_perturb (that's
+                    # a constant target fraction for the whole episode; the
+                    # actual noise _perturb_action draws is randomized and
+                    # independently re-clamped every step).
+                    judge_camera_frames = [] if vlm_judge else None
+                    judge_perturb_magnitudes = [] if vlm_judge else None
+                    judge_camera_key = None
+
                     for idx in range(len(episode_frames)):
                         start_t = time.perf_counter()
 
@@ -507,12 +541,26 @@ def replay_mode(config: dict, auto_use: bool = False, replay_options: dict = Non
                         obs = robot.get_observation()
 
                         if limits is not None and effective_perturb > 0:
-                            action = _perturb_action(action, obs, limits, effective_perturb, dt=1.0 / fps)
+                            perturbed_action = _perturb_action(action, obs, limits, effective_perturb, dt=1.0 / fps)
+                            if judge_perturb_magnitudes is not None:
+                                judge_perturb_magnitudes.append(
+                                    sum(abs(perturbed_action[k] - action[k]) for k in action)
+                                )
+                            action = perturbed_action
+                        elif judge_perturb_magnitudes is not None:
+                            judge_perturb_magnitudes.append(0.0)
 
                         processed_action = robot_action_processor((action, obs))
                         robot.send_action(processed_action)
 
                         log_rerun_data(observation=obs, action=processed_action)
+
+                        if judge_camera_frames is not None:
+                            if judge_camera_key is None:
+                                image_keys = [k for k in obs if k.startswith("observation.images.")]
+                                judge_camera_key = image_keys[0] if image_keys else None
+                            if judge_camera_key is not None:
+                                judge_camera_frames.append(obs[judge_camera_key])
 
                         if new_dataset is not None:
                             from lerobot.datasets.utils import build_dataset_frame
@@ -523,8 +571,25 @@ def replay_mode(config: dict, auto_use: bool = False, replay_options: dict = Non
                         precise_sleep(1 / fps - (time.perf_counter() - start_t))
 
                     if new_dataset is not None:
-                        new_dataset.save_episode()
-                        typer.echo(f"💾 Saved replayed {label} as a new episode in '{save_replay_as}'")
+                        keep_episode = True
+                        if vlm_judge and judge_camera_frames:
+                            from solo.commands.robots.lerobot.vlm_judge import (
+                                judge_episode, select_judge_frame_indices,
+                            )
+                            frame_indices = select_judge_frame_indices(
+                                len(judge_camera_frames), perturbation_magnitudes=judge_perturb_magnitudes,
+                            )
+                            verdict = judge_episode(
+                                [judge_camera_frames[i] for i in frame_indices], task_description=judge_task,
+                            )
+                            keep_episode = verdict is not False  # None (judge failed) defaults to keep
+
+                        if keep_episode:
+                            new_dataset.save_episode()
+                            typer.echo(f"💾 Saved replayed {label} as a new episode in '{save_replay_as}'")
+                        else:
+                            new_dataset.clear_episode_buffer()
+                            typer.echo(f"🗑️  Discarded replayed {label} - VLM judge marked it invalid")
 
                 home_limits = limits
                 if home_limits is None:
@@ -587,6 +652,7 @@ def replay_mode(config: dict, auto_use: bool = False, replay_options: dict = Non
                                     'save_replay_resume': save_replay_resume, 'camera_config': camera_config,
                                     'repeat': repeat_count, 'perturb': perturb,
                                     'perturb_increment': perturb_increment, 'loop': loop,
+                                    'vlm_judge': vlm_judge, 'judge_task': judge_task,
                                 })
 
                                 follower_config = _build_follower_config(follower_port)

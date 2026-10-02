@@ -30,6 +30,8 @@ def robo(
     perturb: float = None,
     perturb_increment: float = None,
     loop: bool = False,
+    vlm_judge: bool = False,
+    judge_task: str = None,
 ):
     """
     Robotics operations: motor setup, calibration, teleoperation, data recording, training, replay, and inference
@@ -58,6 +60,8 @@ def robo(
         'perturb': perturb,
         'perturb_increment': perturb_increment,
         'loop': loop,
+        'vlm_judge': vlm_judge,
+        'judge_task': judge_task,
     } if replay else None
     
     # Use LeRobot handler directly

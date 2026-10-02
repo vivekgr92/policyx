@@ -81,6 +81,19 @@ def robo(
         help="Increase --perturb by this amount on each successive repeat (default: 0, constant). "
         "E.g. --perturb 0.02 --repeat 2 --perturb-increment 0.01 -> repeat 1 uses 0.02, repeat 2 uses 0.03.",
     ),
+    vlm_judge: bool = typer.Option(
+        False,
+        "--vlm-judge",
+        help="With --replay --save-replay-as: judge each newly-generated episode's camera frames "
+        "with a vision-capable Claude model before saving it, discarding ones that don't show a "
+        "valid completion of the task (e.g. a perturbation-induced failure). Requires an Anthropic "
+        "API key (env ANTHROPIC_API_KEY, or you'll be prompted once and it's saved).",
+    ),
+    judge_task: Optional[str] = typer.Option(
+        None,
+        "--judge-task",
+        help="Task description the VLM judge evaluates each episode against (default: 'Pick cup and place').",
+    ),
 ):
     """
     Robotics operations: motor setup, calibration, teleoperation, data recording, training, replay, and inference
@@ -111,7 +124,7 @@ def robo(
         run_policy_server(deployx_serve, port=deployx_port)
         return
     from solo.commands.robo import robo as _robo
-    _robo(motors, calibrate, teleop, record, train, inference, replay, yes, dataset, episode, follower_id, fps, deployx_run, save_replay_as, repeat, perturb, perturb_increment, loop)
+    _robo(motors, calibrate, teleop, record, train, inference, replay, yes, dataset, episode, follower_id, fps, deployx_run, save_replay_as, repeat, perturb, perturb_increment, loop, vlm_judge, judge_task)
 
 
 @app.command()

@@ -31,6 +31,7 @@ setup(
         "accelerate",
         "num2words",
         "websockets",
+        "anthropic",
     ],
     extras_require={
         "dev": ["pytest", "black", "isort"],

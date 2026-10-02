@@ -554,7 +554,12 @@ def replay_mode(config: dict, auto_use: bool = False, replay_options: dict = Non
 
                         if judge_camera_frames is not None:
                             if judge_camera_key is None:
-                                image_keys = [k for k in obs if k.startswith("observation.images.")]
+                                # obs here is the RAW robot observation dict, not
+                                # the saved-dataset feature schema - joint
+                                # positions end in ".pos" (see _split_observation
+                                # in deployx/edge_agent.py), everything else is a
+                                # camera frame under its bare name (e.g. "front").
+                                image_keys = [k for k in obs if not k.endswith(".pos")]
                                 judge_camera_key = image_keys[0] if image_keys else None
                             if judge_camera_key is not None:
                                 judge_camera_frames.append(obs[judge_camera_key])

@@ -98,14 +98,24 @@ _RUNPOD_API_BASE = "https://api.runpod.ai/v2"
 _RUNPOD_POLL_INTERVAL_S = 3.0
 _RUNPOD_POLL_TIMEOUT_S = 300.0  # real measured cold start: 189s delay + ~1s exec (see docstring below)
 
-# Frame-selection tuning. No real failure-case data has validated these numbers
-# yet (the zero-shot prototype only had clean-success episodes to test against)
-# - adjust once real perturbation-induced failures have been judged and checked
-# against what a human would've caught.
-BASELINE_FRAME_COUNT = 10  # evenly-spaced frames across the whole episode, for general coverage
-TOP_PERTURBATION_FRAMES = 5  # highest-realized-perturbation-magnitude frames to zoom in on
+# Frame-selection tuning. Sized down from the original (baseline=10, top_k=5,
+# max_total=25) using REAL measured timing on this machine (Mac mini, Apple
+# M4, 16GB unified memory, qwen3-vl:4b via Ollama), not a guess: a live
+# 15-frame request spent 87.7s just on prompt processing (image encoding +
+# context building) and was still only 85% done when it hit the inactivity
+# timeout - i.e. ~16,470 prompt tokens for 15 frames (~1,098 tokens/frame) at
+# a measured ~159.6 tokens/sec prompt-eval rate. Ollama's public streaming API
+# emits nothing during this phase, so more frames directly means more
+# unmonitored silent wait before generation even starts. Target: keep worst-
+# case prompt-processing time comfortably under 60s, which at the measured
+# per-frame/per-second rates works out to ~8-9 frames - rounded down to 8 for
+# margin. Re-tune once real perturbation-induced-failure accuracy data (not
+# just timing) is available to check whether 8 frames is still enough
+# coverage, separately from this latency-driven cap.
+BASELINE_FRAME_COUNT = 5  # evenly-spaced frames across the whole episode, for general coverage
+TOP_PERTURBATION_FRAMES = 3  # highest-realized-perturbation-magnitude frames to zoom in on
 PERTURBATION_CONTEXT_WINDOW = 1  # also include this many frames before/after each top-perturbation frame
-MAX_TOTAL_JUDGE_FRAMES = 25  # hard cap on total frames sent to the judge per episode (cost/latency)
+MAX_TOTAL_JUDGE_FRAMES = 8  # hard cap on total frames sent to the judge per episode (cost/latency)
 
 
 def select_judge_frame_indices(
@@ -140,14 +150,26 @@ def select_judge_frame_indices(
         fractions = [i / (baseline_count - 1) for i in range(baseline_count)] if baseline_count > 1 else [0.0]
         baseline = sorted(set(int(round(f * (num_frames - 1))) for f in fractions))
 
-    perturbation_focused = set()
+    perturbation_focused = []  # built in priority order so it can be safely
+    # truncated below if it alone exceeds max_total (possible with
+    # well-separated perturbation spikes and a small max_total) - a plain set
+    # would lose that priority ordering.
+    seen = set()
     if perturbation_magnitudes and len(perturbation_magnitudes) == num_frames and top_k > 0:
         ranked = sorted(range(num_frames), key=lambda i: perturbation_magnitudes[i], reverse=True)
         for idx in ranked[:top_k]:
             for offset in range(-context_window, context_window + 1):
                 neighbor = idx + offset
-                if 0 <= neighbor < num_frames:
-                    perturbation_focused.add(neighbor)
+                if 0 <= neighbor < num_frames and neighbor not in seen:
+                    seen.add(neighbor)
+                    perturbation_focused.append(neighbor)
+
+    # perturbation-focused frames alone can exceed max_total (e.g. several
+    # well-separated spikes with a small max_total) - truncate to the
+    # highest-priority ones rather than silently going over budget.
+    if len(perturbation_focused) > max_total:
+        perturbation_focused = perturbation_focused[:max_total]
+    perturbation_focused = set(perturbation_focused)
 
     combined = set(baseline) | perturbation_focused
     if len(combined) <= max_total:

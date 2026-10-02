@@ -30,25 +30,33 @@ call of each new session - see _judge_episode_runpod()'s docstring for the
 measured real numbers. Worth revisiting once local quality/speed is proven
 insufficient for real use.
 
-The Anthropic Claude backend from the original prototype is kept as a second
-fallback (set VLM_JUDGE_BACKEND=anthropic).
+(The original prototype also had an Anthropic Claude fallback backend; it was
+removed per explicit request to keep this file to only the backends actually
+in use - local Ollama now, Runpod later.)
 """
 
 import base64
-import json
 import os
 import time
+from dataclasses import dataclass
 from io import BytesIO
 from typing import Optional
 
 import requests
 import typer
-from rich.prompt import Prompt
-
-from solo.config import CONFIG_PATH
 
 DEFAULT_JUDGE_TASK_DESCRIPTION = "Pick cup and place"
-_JUDGE_MODEL = "claude-sonnet-5"
+
+
+@dataclass
+class JudgeResult:
+    """A judge call's outcome: the verdict (True=valid, False=invalid, None=the
+    call itself could not be completed/verified) plus a short human-readable
+    reason - the model's own stated reasoning when a verdict was reached, or an
+    explanation of what went wrong when it wasn't."""
+
+    verdict: Optional[bool]
+    reason: str
 
 # Local Ollama backend (default) - see module docstring for cost/rationale.
 # qwen3-vl:4b chosen as the final pick (confirmed by the user) over
@@ -80,41 +88,6 @@ BASELINE_FRAME_COUNT = 10  # evenly-spaced frames across the whole episode, for 
 TOP_PERTURBATION_FRAMES = 5  # highest-realized-perturbation-magnitude frames to zoom in on
 PERTURBATION_CONTEXT_WINDOW = 1  # also include this many frames before/after each top-perturbation frame
 MAX_TOTAL_JUDGE_FRAMES = 25  # hard cap on total frames sent to the judge per episode (cost/latency)
-
-
-def _load_config() -> dict:
-    if os.path.exists(CONFIG_PATH):
-        try:
-            with open(CONFIG_PATH, "r") as f:
-                return json.load(f)
-        except (json.JSONDecodeError, FileNotFoundError):
-            return {}
-    return {}
-
-
-def _save_config(config: dict) -> None:
-    os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
-    with open(CONFIG_PATH, "w") as f:
-        json.dump(config, f, indent=4)
-
-
-def get_anthropic_api_key() -> str:
-    """Get the Anthropic API key from env, saved config, or prompt for it once."""
-    env_key = os.environ.get("ANTHROPIC_API_KEY")
-    if env_key:
-        return env_key
-
-    config = _load_config()
-    key = config.get("anthropic", {}).get("api_key")
-    if key:
-        return key
-
-    typer.echo("\n🔑 An Anthropic API key is required for the VLM judge.")
-    typer.echo("   Create one at https://console.anthropic.com/settings/keys")
-    key = Prompt.ask("Enter your Anthropic API key")
-    config.setdefault("anthropic", {})["api_key"] = key
-    _save_config(config)
-    return key
 
 
 def select_judge_frame_indices(
@@ -203,15 +176,28 @@ def _build_judge_prompt_text(task_description: str, num_frames: int) -> str:
     )
 
 
-def _parse_verdict(verdict_text: str) -> Optional[bool]:
+def _parse_verdict(verdict_text: str) -> JudgeResult:
+    """Parse a model response of the form "VALID - <reason>" / "INVALID -
+    <reason>" into a JudgeResult, preserving the model's actual stated reason
+    rather than discarding it."""
     typer.echo(f"🧑‍⚖️  VLM judge: {verdict_text}")
-    upper = verdict_text.strip().upper()
+    stripped = verdict_text.strip()
+    upper = stripped.upper()
+
+    reason = stripped
+    if "-" in stripped:
+        _, _, after_dash = stripped.partition("-")
+        after_dash = after_dash.strip()
+        if after_dash:
+            reason = after_dash
+
     if upper.startswith("VALID"):
-        return True
-    elif upper.startswith("INVALID"):
-        return False
+        return JudgeResult(True, reason)
+    if upper.startswith("INVALID"):
+        return JudgeResult(False, reason)
+
     typer.echo("⚠️  VLM judge: unexpected response format - could not verify.")
-    return None
+    return JudgeResult(None, f"unexpected response format: {stripped[:200]}")
 
 
 def get_runpod_api_key() -> str:
@@ -222,7 +208,7 @@ def get_runpod_api_key() -> str:
     return get_api_key()
 
 
-def _judge_episode_ollama(frames: list, task_description: str) -> Optional[bool]:
+def _judge_episode_ollama(frames: list, task_description: str) -> JudgeResult:
     """
     Judge via a local Ollama server (https://ollama.com) running a
     vision-capable model directly on this machine - no network round trip, no
@@ -241,7 +227,7 @@ def _judge_episode_ollama(frames: list, task_description: str) -> Optional[bool]
     """
     if not frames:
         typer.echo("⚠️  VLM judge: no frames to judge - could not verify.")
-        return None
+        return JudgeResult(None, "no camera frames captured")
 
     images_b64 = [_frame_to_base64_jpeg(frame) for frame in frames]
     payload = {
@@ -269,18 +255,19 @@ def _judge_episode_ollama(frames: list, task_description: str) -> Optional[bool]
         verdict_text = result["message"]["content"]
         return _parse_verdict(verdict_text)
     except requests.exceptions.ConnectionError:
-        typer.echo(
-            f"⚠️  VLM judge: could not reach Ollama at {_OLLAMA_API_BASE} - is it "
-            f"installed and running? (https://ollama.com, then "
-            f"`ollama pull {_OLLAMA_JUDGE_MODEL}`)"
+        reason = (
+            f"could not reach Ollama at {_OLLAMA_API_BASE} - is it installed and "
+            f"running? (https://ollama.com, then `ollama pull {_OLLAMA_JUDGE_MODEL}`)"
         )
-        return None
+        typer.echo(f"⚠️  VLM judge: {reason}")
+        return JudgeResult(None, reason)
     except Exception as e:
-        typer.echo(f"⚠️  VLM judge: Ollama call failed ({e}).")
-        return None
+        reason = f"Ollama call failed: {e}"
+        typer.echo(f"⚠️  VLM judge: {reason}")
+        return JudgeResult(None, reason)
 
 
-def _judge_episode_runpod(frames: list, task_description: str) -> Optional[bool]:
+def _judge_episode_runpod(frames: list, task_description: str) -> JudgeResult:
     """
     Judge via a self-hosted Qwen2.5-VL-7B-Instruct model on Runpod serverless
     (see module docstring for why this is the default backend over a frontier
@@ -303,13 +290,14 @@ def _judge_episode_runpod(frames: list, task_description: str) -> Optional[bool]
     """
     if not frames:
         typer.echo("⚠️  VLM judge: no frames to judge - could not verify.")
-        return None
+        return JudgeResult(None, "no camera frames captured")
 
     try:
         api_key = get_runpod_api_key()
     except Exception as e:
-        typer.echo(f"⚠️  VLM judge: could not get a Runpod API key ({e}).")
-        return None
+        reason = f"could not get a Runpod API key: {e}"
+        typer.echo(f"⚠️  VLM judge: {reason}")
+        return JudgeResult(None, reason)
 
     content = [{"type": "text", "text": _build_judge_prompt_text(task_description, len(frames))}]
     for frame in frames:
@@ -360,86 +348,41 @@ def _judge_episode_runpod(frames: list, task_description: str) -> Optional[bool]
             result = status_resp.json()
 
         if result.get("status") != "COMPLETED":
-            typer.echo(
-                f"⚠️  VLM judge: Runpod job did not complete in time (status={result.get('status')})."
-            )
-            return None
+            reason = f"Runpod job did not complete in time (status={result.get('status')})"
+            typer.echo(f"⚠️  VLM judge: {reason}.")
+            return JudgeResult(None, reason)
 
         verdict_text = result["output"][0]["choices"][0]["message"]["content"]
         return _parse_verdict(verdict_text)
 
     except Exception as e:
-        typer.echo(f"⚠️  VLM judge: Runpod call failed ({e}).")
-        return None
+        reason = f"Runpod call failed: {e}"
+        typer.echo(f"⚠️  VLM judge: {reason}")
+        return JudgeResult(None, reason)
 
 
-def _judge_episode_anthropic(frames: list, task_description: str) -> Optional[bool]:
-    """Fallback backend (set VLM_JUDGE_BACKEND=anthropic) - see module docstring."""
-    try:
-        import anthropic
-    except ImportError:
-        typer.echo("⚠️  VLM judge: the 'anthropic' package is not installed (pip install anthropic).")
-        return None
-
-    if not frames:
-        typer.echo("⚠️  VLM judge: no frames to judge - could not verify.")
-        return None
-
-    try:
-        api_key = get_anthropic_api_key()
-    except Exception as e:
-        typer.echo(f"⚠️  VLM judge: could not get an Anthropic API key ({e}).")
-        return None
-
-    try:
-        client = anthropic.Anthropic(api_key=api_key)
-
-        content = [{"type": "text", "text": _build_judge_prompt_text(task_description, len(frames))}]
-        for frame in frames:
-            content.append(
-                {
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": "image/jpeg",
-                        "data": _frame_to_base64_jpeg(frame),
-                    },
-                }
-            )
-
-        response = client.messages.create(
-            model=_JUDGE_MODEL,
-            max_tokens=200,
-            messages=[{"role": "user", "content": content}],
-        )
-        return _parse_verdict(response.content[0].text.strip())
-
-    except Exception as e:
-        typer.echo(f"⚠️  VLM judge: API call failed ({e}).")
-        return None
-
-
-def judge_episode(frames: list, task_description: str = DEFAULT_JUDGE_TASK_DESCRIPTION) -> Optional[bool]:
+def judge_episode(frames: list, task_description: str = DEFAULT_JUDGE_TASK_DESCRIPTION) -> JudgeResult:
     """
     Judge whether a sequence of camera frames (list of (H, W, 3) uint8 numpy
     arrays, in chronological order) shows a valid completion of
     `task_description`.
 
-    Returns True (valid), False (invalid), or None if the judge call itself
-    failed (missing dependency, bad key, network error, endpoint cold-start
-    exceeded the poll timeout, etc.). This is a strict data-quality gate for
-    perturbation-augmented training data: callers should fail CLOSED and
-    DISCARD the episode on None, the same as an explicit False verdict - an
-    episode that cannot be verified is treated as not trustworthy enough to
-    keep, not defaulted to "probably fine."
+    Returns a JudgeResult: `.verdict` is True (valid), False (invalid), or
+    None if the judge call itself failed (missing dependency, bad key,
+    network error, endpoint cold-start exceeded the poll timeout, etc.);
+    `.reason` is always a short human-readable explanation - the model's own
+    stated reasoning on a real verdict, or what went wrong otherwise. This is
+    a strict data-quality gate for perturbation-augmented training data:
+    callers should fail CLOSED and DISCARD the episode when verdict is None,
+    the same as an explicit False verdict - an episode that cannot be
+    verified is treated as not trustworthy enough to keep, not defaulted to
+    "probably fine."
 
     Backend is local Ollama by default (free, no cold start, runs on this
     machine); set VLM_JUDGE_BACKEND=runpod for the Qwen2.5-VL Runpod
-    serverless path, or VLM_JUDGE_BACKEND=anthropic for the Claude fallback.
+    serverless path.
     """
     backend = os.environ.get("VLM_JUDGE_BACKEND", "ollama").strip().lower()
-    if backend == "anthropic":
-        return _judge_episode_anthropic(frames, task_description)
     if backend == "runpod":
         return _judge_episode_runpod(frames, task_description)
     return _judge_episode_ollama(frames, task_description)

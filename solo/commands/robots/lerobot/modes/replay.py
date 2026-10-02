@@ -62,11 +62,26 @@ def _parse_episode_selection(value, total_episodes: int) -> list:
     return episodes
 
 
+# Hardcoded SO-101 follower rest pose - read directly off the physical arm
+# while it was sitting in a comfortable, natural resting position (not computed
+# as a generic midpoint, which could land somewhere awkward mid-air instead).
+_SO101_REST_POSITION = {
+    "shoulder_pan": -0.88,
+    "shoulder_lift": -110.07,
+    "elbow_flex": 97.19,
+    "wrist_flex": -102.15,
+    "wrist_roll": 49.54,
+    "gripper": 14.76,
+}
+
+
 def _move_to_rest_position(robot, limits, robot_action_processor, fps: int, duration_s: float = 2.0) -> None:
-    """Smoothly interpolate the follower arm to the midpoint of each joint's
-    calibrated safe range over `duration_s`, instead of leaving the arm wherever
-    the last replayed frame happened to stop (often an awkward mid-motion pose)
-    and then abruptly cutting power on disconnect."""
+    """Smoothly interpolate the follower arm to its rest position over
+    `duration_s`, instead of leaving the arm wherever the last replayed frame
+    happened to stop (often an awkward mid-motion pose) and then abruptly
+    cutting power on disconnect. Uses the hardcoded SO-101 rest pose for joints
+    it covers, falling back to the midpoint of the calibrated safe range for
+    any joint it doesn't (e.g. a bimanual or other robot type)."""
     from lerobot.utils.robot_utils import precise_sleep
 
     obs = robot.get_observation()
@@ -75,7 +90,11 @@ def _move_to_rest_position(robot, limits, robot_action_processor, fps: int, dura
         return  # can't safely interpolate without a full current reading
 
     start = [positions[name] for name in limits.names]
-    target = [(limits.position_min[i] + limits.position_max[i]) / 2 for i in range(len(limits.names))]
+    target = [
+        _SO101_REST_POSITION[name] if name in _SO101_REST_POSITION
+        else (limits.position_min[i] + limits.position_max[i]) / 2
+        for i, name in enumerate(limits.names)
+    ]
 
     typer.echo("🏠 Returning to rest position...")
     num_steps = max(1, int(duration_s * fps))

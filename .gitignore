@@ -110,3 +110,4 @@ cython_debug/
 tmp/
 temp/ 
 .qodo
+solo/commands/robots/lerobot/vlm_judge_test_fixtures/*.mp4

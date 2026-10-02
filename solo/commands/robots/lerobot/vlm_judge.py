@@ -75,6 +75,22 @@ class JudgeResult:
 _OLLAMA_API_BASE = os.environ.get("OLLAMA_API_BASE", "http://localhost:11434")
 _OLLAMA_JUDGE_MODEL = os.environ.get("OLLAMA_JUDGE_MODEL", "qwen3-vl:4b")
 
+# Ollama's default context window (4096 tokens) is too small for a multi-frame
+# judge request - must match EXACTLY between the preload call and every real
+# judge call, since loading a model with one num_ctx then requesting a
+# different one forces an actual reload (verified empirically: a preload
+# without this option dropped the already-loaded 32768-context/8.0GB instance
+# down to a 4096-context/3.5GB one, which the next real call would then have
+# had to reload again from scratch - completely defeating the point of
+# preloading). See _judge_episode_ollama()'s real error for why 32768
+# specifically: 5 real frames alone measured at 5628 tokens.
+_OLLAMA_NUM_CTX = 32768
+# How long Ollama keeps the model loaded after the last request specifying
+# this. Applied to the preload call AND every real judge call (sliding
+# window), so a gap between episodes longer than Ollama's 5-minute default
+# doesn't silently evict the model mid-session.
+_OLLAMA_KEEP_ALIVE = "30m"
+
 # Runpod serverless backend (opt-in) - see module docstring for cost/rationale.
 RUNPOD_JUDGE_ENDPOINT_ID = os.environ.get("RUNPOD_JUDGE_ENDPOINT_ID", "lt8yd7ssvip3y9")
 _RUNPOD_JUDGE_MODEL = "Qwen/Qwen2.5-VL-7B-Instruct"
@@ -282,12 +298,8 @@ def _judge_episode_ollama(frames: list, task_description: str) -> JudgeResult:
             }
         ],
         "stream": True,
-        # Ollama's default context window (4096 tokens) is too small for a
-        # multi-frame judge request - 5 real frames alone measured at 5628
-        # tokens (real error: "request (5628 tokens) exceeds the available
-        # context size (4096 tokens)"). Sized with real headroom above the
-        # MAX_TOTAL_JUDGE_FRAMES=25 worst case (~1075 tokens/image observed).
-        "options": {"num_ctx": 32768},
+        "options": {"num_ctx": _OLLAMA_NUM_CTX},
+        "keep_alive": _OLLAMA_KEEP_ALIVE,
     }
 
     try:
@@ -356,6 +368,44 @@ def _judge_episode_ollama(frames: list, task_description: str) -> JudgeResult:
         reason = f"Ollama call failed: {e}"
         typer.echo(f"⚠️  VLM judge: {reason}")
         return JudgeResult(None, reason)
+
+
+def preload_ollama_judge_model() -> bool:
+    """Proactively load the Ollama judge model into memory once, at the start
+    of a replay session, instead of paying the cold-load cost on whichever
+    episode happens to be judged first. Uses Ollama's documented preload
+    pattern - a chat request with an empty `messages` list triggers a model
+    load with no real generation (confirmed live: real response carries
+    `"done_reason": "load"`) - with the EXACT SAME `options`/`keep_alive` the
+    real judge calls use, since a mismatch forces a real reload on the first
+    real call anyway (see _OLLAMA_NUM_CTX's comment - verified empirically,
+    not assumed).
+
+    Non-fatal if it fails: returns False and lets the first real judge call
+    pay the cold-load cost itself, same as before this existed. Call this at
+    most once per `solo robo --replay` process invocation, before the
+    per-episode loop starts - not per-episode."""
+    typer.echo(f"🔥 Preloading {_OLLAMA_JUDGE_MODEL} into memory...")
+    try:
+        resp = requests.post(
+            f"{_OLLAMA_API_BASE}/api/chat",
+            json={
+                "model": _OLLAMA_JUDGE_MODEL,
+                "messages": [],
+                "options": {"num_ctx": _OLLAMA_NUM_CTX},
+                "keep_alive": _OLLAMA_KEEP_ALIVE,
+            },
+            timeout=300,  # a genuine cold load of a multi-GB model can take a while
+        )
+        resp.raise_for_status()
+        typer.echo(f"✅ {_OLLAMA_JUDGE_MODEL} loaded and will stay warm for {_OLLAMA_KEEP_ALIVE}.")
+        return True
+    except Exception as e:
+        typer.echo(
+            f"⚠️  Could not preload {_OLLAMA_JUDGE_MODEL} ({e}) - the first judged "
+            f"episode will pay the load cost instead."
+        )
+        return False
 
 
 def _judge_episode_runpod(frames: list, task_description: str) -> JudgeResult:

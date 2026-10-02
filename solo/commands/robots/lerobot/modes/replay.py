@@ -3,6 +3,7 @@ Replay mode for LeRobot
 Handles replaying recorded dataset episodes on the robot
 """
 
+import os
 import random
 import time
 import typer
@@ -483,6 +484,10 @@ def replay_mode(config: dict, auto_use: bool = False, replay_options: dict = Non
 
         init_rerun(session_name="replay")
         rerun_active = True
+
+        if vlm_judge and os.environ.get("VLM_JUDGE_BACKEND", "ollama").strip().lower() == "ollama":
+            from solo.commands.robots.lerobot.vlm_judge import preload_ollama_judge_model
+            preload_ollama_judge_model()
 
         max_retries = 1
         for attempt in range(max_retries + 1):

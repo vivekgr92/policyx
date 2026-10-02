@@ -12,7 +12,7 @@ VLM_JUDGE_BACKEND=ollama, or just leave it unset) - zero per-call cost, no
 network round trip, no cold-start-vs-idle-cost tradeoff to manage, per an
 explicit request to stop spending time/money on Runpod for this while it's
 still being tested. Requires Ollama installed (https://ollama.com) and the
-judge model pulled locally (`ollama pull llava:7b` by default - see
+judge model pulled locally (`ollama pull qwen3-vl:4b` by default - see
 OLLAMA_JUDGE_MODEL below to use a different one). See
 _judge_episode_ollama()'s docstring for the model choice rationale and real
 caveats on this hardware.
@@ -51,15 +51,19 @@ DEFAULT_JUDGE_TASK_DESCRIPTION = "Pick cup and place"
 _JUDGE_MODEL = "claude-sonnet-5"
 
 # Local Ollama backend (default) - see module docstring for cost/rationale.
-# llava:7b chosen over moondream (1.8B, faster but weaker multi-image
-# reasoning) for this judgment task's need to compare a sequence of frames
-# and make a nuanced valid/invalid call, and over llama3.2-vision (11B,
-# stronger but noticeably slower with no discrete GPU) for speed - a real
-# tradeoff, not verified against real failure-case data on this exact
-# hardware yet. Override via OLLAMA_JUDGE_MODEL if a different local model
-# fits better in practice.
+# qwen3-vl:4b chosen as the final pick (confirmed by the user) over
+# qwen2.5vl:7b (same Qwen-VL lineage already proven on the Runpod backend,
+# but 7B's ~5-9GB real runtime footprint leaves uncomfortably little headroom
+# on this machine's real hardware - confirmed via sysctl/system_profiler:
+# Mac mini, Apple M4, 16GB unified memory) and over llava:7b (older
+# architecture, no longer the best fit now that Ollama has first-class
+# Qwen3-VL support). Qwen3-VL is a newer generation than Qwen2.5-VL, and
+# Ollama's own team describes its smaller sizes as working "exceptionally
+# well for their size" - the 4B size trades some raw quality for
+# substantially more memory headroom on 16GB unified memory. Override via
+# OLLAMA_JUDGE_MODEL if a different local model fits better in practice.
 _OLLAMA_API_BASE = os.environ.get("OLLAMA_API_BASE", "http://localhost:11434")
-_OLLAMA_JUDGE_MODEL = os.environ.get("OLLAMA_JUDGE_MODEL", "llava:7b")
+_OLLAMA_JUDGE_MODEL = os.environ.get("OLLAMA_JUDGE_MODEL", "qwen3-vl:4b")
 
 # Runpod serverless backend (opt-in) - see module docstring for cost/rationale.
 RUNPOD_JUDGE_ENDPOINT_ID = os.environ.get("RUNPOD_JUDGE_ENDPOINT_ID", "lt8yd7ssvip3y9")
@@ -224,17 +228,16 @@ def _judge_episode_ollama(frames: list, task_description: str) -> Optional[bool]
     vision-capable model directly on this machine - no network round trip, no
     per-call cost, no cold-start-vs-idle-cost tradeoff. Requires Ollama
     installed and running (`ollama serve`, or the menu-bar app which runs it
-    automatically) and the model already pulled (`ollama pull llava:7b`, or
-    whatever OLLAMA_JUDGE_MODEL is set to).
+    automatically) and the model already pulled (`ollama pull qwen3-vl:4b`,
+    or whatever OLLAMA_JUDGE_MODEL is set to).
 
-    Honest caveat, not yet measured on real hardware: this was implemented
-    and wired up but could not be live-tested in this environment - Ollama
-    itself is not installed here (`which ollama` found nothing, and there's
-    no Homebrew either to install it non-interactively). Real speed/quality
-    on an actual Mac mini (no discrete GPU, Apple Silicon unified memory via
-    Metal) is unverified; expect noticeably slower inference than a GPU
-    backend, and unknown judgment accuracy until checked against real
-    perturbation-induced failures the same way the Runpod path was checked.
+    Real measured numbers on this machine (Mac mini, Apple M4, 16GB unified
+    memory, no discrete GPU) - see the commit this comment was added in for
+    the actual first-call vs warm-call timing and `ollama ps` memory
+    footprint. Judgment accuracy is still unverified against real
+    perturbation-induced failures (only clean-success episodes were
+    available to test against, same caveat as the Runpod path originally
+    had) - treat verdicts as unproven until checked against known-bad data.
     """
     if not frames:
         typer.echo("⚠️  VLM judge: no frames to judge - could not verify.")
@@ -251,6 +254,12 @@ def _judge_episode_ollama(frames: list, task_description: str) -> Optional[bool]
             }
         ],
         "stream": False,
+        # Ollama's default context window (4096 tokens) is too small for a
+        # multi-frame judge request - 5 real frames alone measured at 5628
+        # tokens (real error: "request (5628 tokens) exceeds the available
+        # context size (4096 tokens)"). Sized with real headroom above the
+        # MAX_TOTAL_JUDGE_FRAMES=25 worst case (~1075 tokens/image observed).
+        "options": {"num_ctx": 32768},
     }
 
     try:

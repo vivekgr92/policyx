@@ -36,6 +36,7 @@ in use - local Ollama now, Runpod later.)
 """
 
 import base64
+import json
 import os
 import time
 from dataclasses import dataclass
@@ -44,6 +45,7 @@ from typing import Optional
 
 import requests
 import typer
+from tqdm import tqdm
 
 DEFAULT_JUDGE_TASK_DESCRIPTION = "Pick cup and place"
 
@@ -208,6 +210,37 @@ def get_runpod_api_key() -> str:
     return get_api_key()
 
 
+# Max gap between streamed chunks before treating the call as truly stuck
+# rather than just slow under real system load. This machine's 16GB unified
+# memory is shared between the solo robo --replay process itself (camera
+# capture, rerun visualization) and the model inference all at once during a
+# live session - real observed call durations have ranged from ~13s up to a
+# genuine >180s read-timeout failure under contention, which a flat
+# total-duration timeout can't distinguish from an actual hang. Streaming lets
+# us reset the clock on every real chunk received instead: requests' own
+# per-read timeout (passed to a stream=True request) already applies to each
+# individual socket read rather than the whole response, so a single `timeout=`
+# value here gives inactivity semantics for free - verified empirically, not
+# assumed.
+_OLLAMA_INACTIVITY_TIMEOUT_S = 90.0
+
+
+def _extract_real_stats(final_chunk: dict) -> str:
+    """Build a short real-numbers summary from Ollama's actual final streamed
+    chunk (done=true) - real field names confirmed by inspecting a live
+    response, not guessed: total_duration/load_duration/prompt_eval_count/
+    prompt_eval_duration/eval_count/eval_duration (durations in nanoseconds)."""
+    eval_count = final_chunk.get("eval_count")
+    eval_duration_ns = final_chunk.get("eval_duration")
+    total_duration_ns = final_chunk.get("total_duration")
+    parts = []
+    if total_duration_ns:
+        parts.append(f"{total_duration_ns / 1e9:.1f}s total")
+    if eval_count and eval_duration_ns:
+        parts.append(f"{eval_count} tokens @ {eval_count / (eval_duration_ns / 1e9):.1f} tok/s")
+    return ", ".join(parts) if parts else "no timing stats in final chunk"
+
+
 def _judge_episode_ollama(frames: list, task_description: str) -> JudgeResult:
     """
     Judge via a local Ollama server (https://ollama.com) running a
@@ -217,19 +250,28 @@ def _judge_episode_ollama(frames: list, task_description: str) -> JudgeResult:
     automatically) and the model already pulled (`ollama pull qwen3-vl:4b`,
     or whatever OLLAMA_JUDGE_MODEL is set to).
 
-    Real measured numbers on this machine (Mac mini, Apple M4, 16GB unified
-    memory, no discrete GPU) - see the commit this comment was added in for
-    the actual first-call vs warm-call timing and `ollama ps` memory
-    footprint. Judgment accuracy is still unverified against real
-    perturbation-induced failures (only clean-success episodes were
-    available to test against, same caveat as the Runpod path originally
-    had) - treat verdicts as unproven until checked against known-bad data.
+    Streams the response (see _OLLAMA_INACTIVITY_TIMEOUT_S) and renders two
+    real tqdm bars: a determinate one while base64-encoding the known frame
+    count, and an indeterminate one (total=None, manually incremented) over
+    streamed chunks as they arrive, with the model's real generated text
+    echoed live via tqdm.write() so it doesn't corrupt the bar. Real measured
+    numbers on this machine (Mac mini, Apple M4, 16GB unified memory, no
+    discrete GPU) - see the commit this comment was added in for the actual
+    first-call vs warm-call timing and `ollama ps` memory footprint. Judgment
+    accuracy is still unverified against real perturbation-induced failures
+    (only clean-success episodes were available to test against, same caveat
+    as the Runpod path originally had) - treat verdicts as unproven until
+    checked against known-bad data.
     """
     if not frames:
         typer.echo("⚠️  VLM judge: no frames to judge - could not verify.")
         return JudgeResult(None, "no camera frames captured")
 
-    images_b64 = [_frame_to_base64_jpeg(frame) for frame in frames]
+    typer.echo(f"📤 Sending {len(frames)} frames to {_OLLAMA_JUDGE_MODEL} for judging...")
+    images_b64 = [
+        _frame_to_base64_jpeg(frame)
+        for frame in tqdm(frames, desc="Encoding frames", unit="frame")
+    ]
     payload = {
         "model": _OLLAMA_JUDGE_MODEL,
         "messages": [
@@ -239,7 +281,7 @@ def _judge_episode_ollama(frames: list, task_description: str) -> JudgeResult:
                 "images": images_b64,
             }
         ],
-        "stream": False,
+        "stream": True,
         # Ollama's default context window (4096 tokens) is too small for a
         # multi-frame judge request - 5 real frames alone measured at 5628
         # tokens (real error: "request (5628 tokens) exceeds the available
@@ -249,15 +291,64 @@ def _judge_episode_ollama(frames: list, task_description: str) -> JudgeResult:
     }
 
     try:
-        resp = requests.post(f"{_OLLAMA_API_BASE}/api/chat", json=payload, timeout=180)
+        resp = requests.post(
+            f"{_OLLAMA_API_BASE}/api/chat",
+            json=payload,
+            timeout=_OLLAMA_INACTIVITY_TIMEOUT_S,
+            stream=True,
+        )
         resp.raise_for_status()
-        result = resp.json()
-        verdict_text = result["message"]["content"]
+
+        content_parts = []
+        final_chunk = None
+        thinking_started = False
+        content_started = False
+        with tqdm(total=None, desc="Generating", unit="chunk") as bar:
+            for line in resp.iter_lines():
+                if not line:
+                    continue
+                chunk = json.loads(line)
+                bar.update(1)
+                msg = chunk.get("message", {})
+                thinking_delta = msg.get("thinking") or ""
+                content_delta = msg.get("content") or ""
+                if thinking_delta:
+                    if not thinking_started:
+                        tqdm.write("🧠 thinking: ", end="")
+                        thinking_started = True
+                    tqdm.write(thinking_delta, end="")
+                if content_delta:
+                    if not content_started:
+                        tqdm.write("\n💬 answer: ", end="")
+                        content_started = True
+                    tqdm.write(content_delta, end="")
+                    content_parts.append(content_delta)
+                if chunk.get("done"):
+                    final_chunk = chunk
+                    break
+        if thinking_started or content_started:
+            tqdm.write("")  # final newline after the live-streamed text
+
+        if final_chunk is not None:
+            typer.echo(f"📊 {_extract_real_stats(final_chunk)}")
+
+        verdict_text = "".join(content_parts).strip()
+        if not verdict_text:
+            reason = "Ollama produced no final-answer content (only reasoning/thinking tokens)"
+            typer.echo(f"⚠️  VLM judge: {reason}")
+            return JudgeResult(None, reason)
         return _parse_verdict(verdict_text)
     except requests.exceptions.ConnectionError:
         reason = (
             f"could not reach Ollama at {_OLLAMA_API_BASE} - is it installed and "
             f"running? (https://ollama.com, then `ollama pull {_OLLAMA_JUDGE_MODEL}`)"
+        )
+        typer.echo(f"⚠️  VLM judge: {reason}")
+        return JudgeResult(None, reason)
+    except requests.exceptions.ReadTimeout:
+        reason = (
+            f"Ollama produced no streamed output for {_OLLAMA_INACTIVITY_TIMEOUT_S:.0f}s - "
+            f"likely genuinely stuck, not just slow under real system load"
         )
         typer.echo(f"⚠️  VLM judge: {reason}")
         return JudgeResult(None, reason)

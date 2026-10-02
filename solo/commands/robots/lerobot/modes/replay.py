@@ -583,18 +583,13 @@ def replay_mode(config: dict, auto_use: bool = False, replay_options: dict = Non
                                 frame_indices = select_judge_frame_indices(
                                     len(judge_camera_frames), perturbation_magnitudes=judge_perturb_magnitudes,
                                 )
-                                from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn
-
-                                with Progress(
-                                    SpinnerColumn(),
-                                    TextColumn("[progress.description]{task.description}"),
-                                    BarColumn(),
-                                    transient=True,
-                                ) as progress:
-                                    progress.add_task("🧠 Judging VLM for task completion...", total=None)
-                                    result = judge_episode(
-                                        [judge_camera_frames[i] for i in frame_indices], task_description=judge_task,
-                                    )
+                                # judge_episode() (the Ollama backend specifically)
+                                # renders its own real tqdm progress bars and live
+                                # streamed text internally - no outer spinner needed
+                                # here, that would just duplicate/conflict with it.
+                                result = judge_episode(
+                                    [judge_camera_frames[i] for i in frame_indices], task_description=judge_task,
+                                )
                                 # Fail CLOSED: an episode is only kept if the judge
                                 # explicitly says VALID. An explicit INVALID verdict
                                 # and a failed/unreachable judge call (verdict is

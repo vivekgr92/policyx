@@ -444,6 +444,18 @@ def replay_mode(config: dict, auto_use: bool = False, replay_options: dict = Non
                 ) from e
             raise
 
+        # Real per-episode task strings as actually recorded (e.g. "Pick A to B"
+        # for even episode indices, "Pick B to A" for odd, in an alternating
+        # --loop recording) - looked up from the dataset's own metadata so the
+        # VLM judge evaluates each episode against the task it actually is,
+        # not a single static description applied to every episode regardless
+        # of direction. Falls back to `judge_task` (the manually-entered/
+        # default judge description) only when an episode has no recorded task.
+        episode_task_lookup = {
+            row["episode_index"]: ", ".join(row["tasks"]) if row["tasks"] else None
+            for row in dataset.meta.episodes
+        }
+
         if save_replay_as:
             # Async image writing (threads > 0) so JPEG/video encoding doesn't
             # block the replay loop's per-step timing - same rationale as
@@ -592,8 +604,9 @@ def replay_mode(config: dict, auto_use: bool = False, replay_options: dict = Non
                                 # renders its own real tqdm progress bars and live
                                 # streamed text internally - no outer spinner needed
                                 # here, that would just duplicate/conflict with it.
+                                real_task = episode_task_lookup.get(ep) or judge_task
                                 result = judge_episode(
-                                    [judge_camera_frames[i] for i in frame_indices], task_description=judge_task,
+                                    [judge_camera_frames[i] for i in frame_indices], task_description=real_task,
                                 )
                                 # Fail CLOSED: an episode is only kept if the judge
                                 # explicitly says VALID. An explicit INVALID verdict

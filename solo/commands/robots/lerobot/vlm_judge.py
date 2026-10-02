@@ -166,10 +166,28 @@ def select_judge_frame_indices(
     selected = set(range(min(start_count, num_frames)))
     selected |= set(range(max(0, num_frames - end_count), num_frames))
 
-    if perturbation_magnitudes and len(perturbation_magnitudes) == num_frames and middle_top_k > 0:
-        middle_candidates = [i for i in range(num_frames) if i not in selected]
-        ranked = sorted(middle_candidates, key=lambda i: perturbation_magnitudes[i], reverse=True)
-        for idx in ranked[:middle_top_k]:
+    middle_candidates = [i for i in range(num_frames) if i not in selected]
+    if middle_candidates and middle_top_k > 0:
+        has_real_perturbation_signal = (
+            perturbation_magnitudes
+            and len(perturbation_magnitudes) == num_frames
+            and max(perturbation_magnitudes) > 0
+        )
+        if has_real_perturbation_signal:
+            ranked = sorted(middle_candidates, key=lambda i: perturbation_magnitudes[i], reverse=True)
+            middle_picks = ranked[:middle_top_k]
+        else:
+            # No informative perturbation signal (none provided, or all zero,
+            # e.g. a plain --perturb 0 run) - ranking by an all-equal key
+            # degenerates to picking frames right after the start (stable
+            # sort ties resolve to ascending index), clustering two groups at
+            # the endpoints with NOTHING from the real middle of the episode
+            # where the actual grasp/transport motion happens. Fall back to
+            # fixed, evenly-spaced genuine middle-of-episode frames instead,
+            # so the judge always sees some real mid-episode motion.
+            step = len(middle_candidates) / (middle_top_k + 1)
+            middle_picks = [middle_candidates[int(step * (k + 1))] for k in range(middle_top_k)]
+        for idx in middle_picks:
             if len(selected) >= max_total:
                 break
             selected.add(idx)

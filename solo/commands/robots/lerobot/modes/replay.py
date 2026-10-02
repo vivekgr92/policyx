@@ -569,24 +569,43 @@ def replay_mode(config: dict, auto_use: bool = False, replay_options: dict = Non
 
                     if new_dataset is not None:
                         keep_episode = True
-                        if vlm_judge and judge_camera_frames:
-                            from solo.commands.robots.lerobot.vlm_judge import (
-                                judge_episode, select_judge_frame_indices,
-                            )
-                            frame_indices = select_judge_frame_indices(
-                                len(judge_camera_frames), perturbation_magnitudes=judge_perturb_magnitudes,
-                            )
-                            verdict = judge_episode(
-                                [judge_camera_frames[i] for i in frame_indices], task_description=judge_task,
-                            )
-                            keep_episode = verdict is not False  # None (judge failed) defaults to keep
+                        discard_reason = None
+                        if vlm_judge:
+                            if judge_camera_frames:
+                                from solo.commands.robots.lerobot.vlm_judge import (
+                                    judge_episode, select_judge_frame_indices,
+                                )
+                                frame_indices = select_judge_frame_indices(
+                                    len(judge_camera_frames), perturbation_magnitudes=judge_perturb_magnitudes,
+                                )
+                                verdict = judge_episode(
+                                    [judge_camera_frames[i] for i in frame_indices], task_description=judge_task,
+                                )
+                                # Fail CLOSED: an episode is only kept if the judge
+                                # explicitly says VALID. An explicit INVALID verdict
+                                # and a failed/unreachable judge call (verdict is
+                                # None) both discard - this is a strict data-quality
+                                # gate for perturbation-augmented training data, so
+                                # an unverifiable episode is treated the same as an
+                                # invalid one rather than being kept by default.
+                                if verdict is True:
+                                    keep_episode = True
+                                elif verdict is False:
+                                    keep_episode = False
+                                    discard_reason = "VLM judge marked it invalid"
+                                else:
+                                    keep_episode = False
+                                    discard_reason = "VLM judge could not verify it (call failed/unavailable)"
+                            else:
+                                keep_episode = False
+                                discard_reason = "VLM judge could not verify it (no camera frames captured)"
 
                         if keep_episode:
                             new_dataset.save_episode()
                             typer.echo(f"💾 Saved replayed {label} as a new episode in '{save_replay_as}'")
                         else:
                             new_dataset.clear_episode_buffer()
-                            typer.echo(f"🗑️  Discarded replayed {label} - VLM judge marked it invalid")
+                            typer.echo(f"🗑️  Discarded replayed {label} - {discard_reason}")
 
                 home_limits = limits
                 if home_limits is None:

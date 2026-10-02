@@ -187,7 +187,7 @@ def _parse_verdict(verdict_text: str) -> Optional[bool]:
         return True
     elif upper.startswith("INVALID"):
         return False
-    typer.echo("⚠️  VLM judge: unexpected response format, keeping episode.")
+    typer.echo("⚠️  VLM judge: unexpected response format - could not verify.")
     return None
 
 
@@ -216,17 +216,18 @@ def _judge_episode_runpod(frames: list, task_description: str) -> Optional[bool]
     a failure. A genuine timeout (exceeding even a cold start by a wide
     margin) almost certainly means real trouble (capacity exhausted, worker
     crash-looping) rather than "just starting up" - in that case, same as any
-    other judge-call failure, we fail open and keep the episode rather than
-    silently discarding potentially-good data or blocking the loop indefinitely.
+    other judge-call failure, the caller fails CLOSED (discards the episode)
+    rather than risking an unverified, possibly perturbation-corrupted episode
+    silently entering the training set.
     """
     if not frames:
-        typer.echo("⚠️  VLM judge: no frames to judge. Keeping episode.")
+        typer.echo("⚠️  VLM judge: no frames to judge - could not verify.")
         return None
 
     try:
         api_key = get_runpod_api_key()
     except Exception as e:
-        typer.echo(f"⚠️  VLM judge: could not get a Runpod API key ({e}). Keeping episode.")
+        typer.echo(f"⚠️  VLM judge: could not get a Runpod API key ({e}).")
         return None
 
     content = [{"type": "text", "text": _build_judge_prompt_text(task_description, len(frames))}]
@@ -274,8 +275,7 @@ def _judge_episode_runpod(frames: list, task_description: str) -> Optional[bool]
 
         if result.get("status") != "COMPLETED":
             typer.echo(
-                f"⚠️  VLM judge: Runpod job did not complete in time (status={result.get('status')}). "
-                f"Keeping episode."
+                f"⚠️  VLM judge: Runpod job did not complete in time (status={result.get('status')})."
             )
             return None
 
@@ -283,7 +283,7 @@ def _judge_episode_runpod(frames: list, task_description: str) -> Optional[bool]
         return _parse_verdict(verdict_text)
 
     except Exception as e:
-        typer.echo(f"⚠️  VLM judge: Runpod call failed ({e}). Keeping episode.")
+        typer.echo(f"⚠️  VLM judge: Runpod call failed ({e}).")
         return None
 
 
@@ -292,17 +292,17 @@ def _judge_episode_anthropic(frames: list, task_description: str) -> Optional[bo
     try:
         import anthropic
     except ImportError:
-        typer.echo("⚠️  VLM judge: the 'anthropic' package is not installed (pip install anthropic). Keeping episode.")
+        typer.echo("⚠️  VLM judge: the 'anthropic' package is not installed (pip install anthropic).")
         return None
 
     if not frames:
-        typer.echo("⚠️  VLM judge: no frames to judge. Keeping episode.")
+        typer.echo("⚠️  VLM judge: no frames to judge - could not verify.")
         return None
 
     try:
         api_key = get_anthropic_api_key()
     except Exception as e:
-        typer.echo(f"⚠️  VLM judge: could not get an Anthropic API key ({e}). Keeping episode.")
+        typer.echo(f"⚠️  VLM judge: could not get an Anthropic API key ({e}).")
         return None
 
     try:
@@ -329,7 +329,7 @@ def _judge_episode_anthropic(frames: list, task_description: str) -> Optional[bo
         return _parse_verdict(response.content[0].text.strip())
 
     except Exception as e:
-        typer.echo(f"⚠️  VLM judge: API call failed ({e}). Keeping episode.")
+        typer.echo(f"⚠️  VLM judge: API call failed ({e}).")
         return None
 
 
@@ -341,9 +341,11 @@ def judge_episode(frames: list, task_description: str = DEFAULT_JUDGE_TASK_DESCR
 
     Returns True (valid), False (invalid), or None if the judge call itself
     failed (missing dependency, bad key, network error, endpoint cold-start
-    exceeded the poll timeout, etc.) - callers should default to KEEPING the
-    episode on None rather than discarding potentially-good data over a
-    transient failure.
+    exceeded the poll timeout, etc.). This is a strict data-quality gate for
+    perturbation-augmented training data: callers should fail CLOSED and
+    DISCARD the episode on None, the same as an explicit False verdict - an
+    episode that cannot be verified is treated as not trustworthy enough to
+    keep, not defaulted to "probably fine."
 
     Backend is Runpod serverless (Qwen2.5-VL) by default; set
     VLM_JUDGE_BACKEND=anthropic to use the Claude fallback instead.

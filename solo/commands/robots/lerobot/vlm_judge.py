@@ -366,6 +366,64 @@ def _parse_verdict(verdict_text: str) -> JudgeResult:
     return JudgeResult(None, f"unexpected response format: {stripped[:200]}")
 
 
+def detect_object_bbox(frame, object_description: str) -> "tuple[Optional[tuple], str]":
+    """Ask the local Ollama judge model for a bounding box of `object_description`
+    in `frame`, via Qwen-VL's documented grounding convention (JSON
+    `{"bbox_2d": [x1,y1,x2,y2]}` in pixel coordinates for the given image size -
+    confirmed this is the format the model actually replies to cleanly on this
+    serving path, tried alongside a `<|box_start|>...<|box_end|>` special-token
+    variant which also parsed cleanly).
+
+    Returns `(box, raw_text)` - `box` is `(x1,y1,x2,y2)` in pixel coordinates if
+    parsing succeeded, else `None`; `raw_text` is always the model's real
+    response for transparency, even on a parse failure.
+
+    REAL RELIABILITY CAVEAT, verified empirically, not assumed: the returned
+    coordinates are consistently WRONG on this exact serving path (Ollama
+    qwen3-vl:4b-instruct) by a large, systematic offset - tested against a
+    real 1280x720 frame where 3 cups are visually at y≈450-545 (confirmed by
+    drawing the returned boxes and looking at them), and every one of 4
+    different real test calls (varied prompt wording, varied output format,
+    with and without an explicit image-dimension/position hint) returned
+    cups at y≈610-734 instead - off by a consistent ~160-190px downward, every
+    time. The horizontal (x) positions and relative left-to-right spacing
+    between multiple detected objects were plausible; only the vertical axis
+    showed this consistent bias. This strongly suggests a real coordinate-
+    remapping bug somewhere in Ollama/llama.cpp's vision-input resize
+    pipeline (the model's internal patch grid not being mapped back to
+    original pixel space correctly), not a prompt-engineering issue - changing
+    wording, output format, or adding explicit dimension/position hints to the
+    prompt did not change the result. DO NOT treat this function's returned
+    box as trustworthy for any real decision yet; it exists for exploration in
+    the Gradio playground only, not wired into judge_episode()."""
+    content = (
+        f'Locate the "{object_description}" in this image, which is exactly '
+        f"{getattr(frame, 'shape', (None, None))[1] if hasattr(frame, 'shape') else '?'} "
+        f"pixels wide. Output its bounding box as JSON: {{\"bbox_2d\": [x1,y1,x2,y2]}} "
+        f"in pixel coordinates. Respond with ONLY that JSON object, nothing else."
+    )
+    payload = {
+        "model": _OLLAMA_JUDGE_MODEL,
+        "messages": [{"role": "user", "content": content, "images": [_frame_to_base64_jpeg(frame)]}],
+        "stream": False,
+        "think": False,
+        "options": {"num_ctx": _OLLAMA_NUM_CTX},
+        "keep_alive": _OLLAMA_KEEP_ALIVE,
+    }
+    try:
+        resp = requests.post(f"{_OLLAMA_API_BASE}/api/chat", json=payload, timeout=120)
+        resp.raise_for_status()
+        raw_text = resp.json().get("message", {}).get("content", "").strip()
+    except Exception as e:
+        return None, f"grounding call failed: {e}"
+
+    match = re.search(r"\[?\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)\s*\]?", raw_text)
+    if not match:
+        return None, raw_text
+    x1, y1, x2, y2 = (int(v) for v in match.groups())
+    return (x1, y1, x2, y2), raw_text
+
+
 def get_runpod_api_key() -> str:
     """Reuses runpod_train.py's existing get_api_key() (same env/config/prompt
     pattern already used for pod management) rather than duplicating it."""

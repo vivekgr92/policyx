@@ -39,9 +39,11 @@ from solo.commands.robots.lerobot.vlm_judge import (
     _OLLAMA_NUM_CTX,
     _OLLAMA_KEEP_ALIVE,
     _frame_to_base64_jpeg,
+    detect_object_bbox,
 )
 
 DEFAULT_QUESTION = "Is the cup upright?"
+DEFAULT_OBJECT = "cup"
 
 
 def _pick_camera_index() -> int:
@@ -124,6 +126,21 @@ def _ask_ollama(frame_rgb, question: str) -> str:
         return f"⚠️ Ollama call failed: {e}"
 
 
+def _draw_bbox(frame_rgb, box):
+    """Draw a (x1,y1,x2,y2) pixel box on a copy of frame_rgb using PIL
+    (matching this repo's existing frame-array convention - RGB numpy arrays
+    throughout vlm_judge.py/_frame_to_base64_jpeg - rather than introducing a
+    second, BGR-based OpenCV drawing convention just for this one view)."""
+    from PIL import Image, ImageDraw
+
+    image = Image.fromarray(frame_rgb.astype("uint8")).convert("RGB")
+    if box is not None:
+        x1, y1, x2, y2 = box
+        draw = ImageDraw.Draw(image)
+        draw.rectangle([x1, y1, x2, y2], outline=(255, 0, 0), width=4)
+    return image
+
+
 def build_app(camera: _LiveCamera) -> gr.Blocks:
     with gr.Blocks(title="VLM Judge Playground") as demo:
         gr.Markdown(
@@ -139,6 +156,22 @@ def build_app(camera: _LiveCamera) -> gr.Blocks:
                 ask_btn = gr.Button("Ask", variant="primary")
                 answer = gr.Textbox(label="Model response", lines=8, interactive=False)
 
+        gr.Markdown(
+            "### Object detection (bounding box)\n"
+            "⚠️ **Known unreliable**: tested against real frames and found a "
+            "consistent, large vertical-axis offset in the returned "
+            "coordinates (box drawn here will likely NOT line up with the "
+            "real object) - shown for exploration only, not trustworthy yet. "
+            "See `detect_object_bbox()`'s docstring in `vlm_judge.py` for the "
+            "real test evidence."
+        )
+        with gr.Row():
+            boxed_image = gr.Image(label="Detected box (drawn on last-asked frame)", interactive=False)
+            with gr.Column():
+                object_desc = gr.Textbox(label="Object to find", value=DEFAULT_OBJECT, lines=1)
+                detect_btn = gr.Button("Detect Object")
+                raw_coords = gr.Textbox(label="Raw model response (coordinates)", lines=3, interactive=False)
+
         timer = gr.Timer(0.5)
         timer.tick(fn=camera.read_latest, outputs=image)
 
@@ -146,7 +179,15 @@ def build_app(camera: _LiveCamera) -> gr.Blocks:
             frame = camera.get_latest()
             return _ask_ollama(frame, question_text)
 
+        def _on_detect(object_text):
+            frame = camera.get_latest()
+            if frame is None:
+                return None, "⚠️ No frame available yet."
+            box, raw_text = detect_object_bbox(frame, object_text.strip() or DEFAULT_OBJECT)
+            return _draw_bbox(frame, box), raw_text
+
         ask_btn.click(fn=_on_ask, inputs=question, outputs=answer)
+        detect_btn.click(fn=_on_detect, inputs=object_desc, outputs=[boxed_image, raw_coords])
 
     return demo
 

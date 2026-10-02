@@ -38,6 +38,7 @@ in use - local Ollama now, Runpod later.)
 import base64
 import json
 import os
+import subprocess
 import time
 from dataclasses import dataclass
 from io import BytesIO
@@ -262,6 +263,113 @@ def get_runpod_api_key() -> str:
 # assumed.
 _OLLAMA_INACTIVITY_TIMEOUT_S = 90.0
 
+# The real bug this fixes: Ollama's public streaming API emits ZERO bytes
+# during prompt processing (image encoding + context building) - confirmed
+# empirically, twice, with fresh/uncached frames: a real 15-frame request
+# streamed NOTHING for 100.37s and 106.65s respectively before its first byte.
+# A flat timeout short enough to catch a genuine mid-generation stall (90s)
+# is too short to survive this silent phase once enough frames are involved -
+# exactly what happened in the live bug report (a 15-frame call hit a 180s-era
+# flat timeout while still only 85% through prompt eval). MAX_TOTAL_JUDGE_FRAMES
+# was independently reduced to 8 specifically to shrink this phase, but this
+# scales explicitly rather than assuming frame count always stays under
+# whatever that cap happens to be set to.
+#
+# Deliberately a SIMPLE time-per-frame estimate, not a token-based one: a
+# token-per-frame model was tried first and found unreliable - real testing
+# showed 8 real frames from one actual recorded episode need ~16,600 prompt
+# tokens (not the ~9,000 a flat "~1,100 tokens/frame" estimate predicted from
+# an earlier, different episode's frames), because token count depends on
+# real image content/complexity, not just frame count. A generous flat
+# per-frame time allowance, calibrated against the worst real observation so
+# far (8 frames still only 86% through prompt eval at 98.4s, projecting
+# ~115s+ just for prompt eval to finish), is simpler and more robust against
+# this content-dependent variance than trying to precisely predict token
+# counts. `requests` applies a single read timeout uniformly across an
+# entire streamed response (no public way to use a shorter value once
+# generation starts and a longer one during prompt eval), so this same
+# number also becomes the inter-chunk stall-detection window during
+# generation - looser stall detection there in exchange for not prematurely
+# killing a call that's still legitimately encoding frames, the same
+# fail-closed-favors-correctness tradeoff already made elsewhere in this file.
+_OLLAMA_SECONDS_PER_FRAME_ESTIMATE = 35.0
+_OLLAMA_MIN_REQUEST_TIMEOUT_S = 250.0  # floor for even a single frame, real margin over observed generation-time variance
+
+# Ollama's own server log (real install-default path for the macOS app -
+# confirmed present and actively written on this machine; NOT a stable public
+# API, path/format could differ across installs/versions). Used only for a
+# best-effort live progress display during the silent prompt-processing
+# phase described above - any failure to find/read/parse it is swallowed and
+# never affects the real judge call.
+_OLLAMA_LOG_PATH = os.path.expanduser(os.environ.get("OLLAMA_LOG_PATH", "~/.ollama/logs/server.log"))
+
+
+def _estimate_ollama_request_timeout_s(num_frames: int) -> float:
+    """A generous read-timeout covering the worst-case prompt-processing
+    duration for `num_frames` frames - see the constants above this function
+    for the real measured basis and why a single value has to cover both the
+    prompt-eval and generation phases."""
+    return max(_OLLAMA_MIN_REQUEST_TIMEOUT_S, num_frames * _OLLAMA_SECONDS_PER_FRAME_ESTIMATE)
+
+
+def _start_prompt_progress_tail():
+    """Best-effort live display of Ollama's own real prompt-processing
+    progress (n_tokens / percent / tokens-per-sec) during the phase where the
+    public streaming API itself emits nothing at all (see the timeout
+    constants above - confirmed empirically). Tails `_OLLAMA_LOG_PATH` and
+    lets matching lines print straight to this terminal.
+
+    Deliberately a genuine OS subprocess, not a Python thread: a
+    threading.Thread doing time.sleep()-based polling alongside the main
+    thread's blocking HTTP read was tried first and found UNRELIABLE on this
+    machine - tested directly: the watchdog thread's own sleep() calls were
+    observed to stall for 100+ seconds right alongside the main thread's
+    blocked socket read, rather than firing on schedule, even though
+    CPython's socket module is documented to release the GIL during blocking
+    reads. A real subprocess shares no interpreter/GIL with the request at
+    all, so its output streams to the terminal completely independently of
+    whatever the main thread is doing - verified empirically to actually work
+    where the threading approach did not.
+
+    Returns None (silently) if the log doesn't exist or the subprocess can't
+    be started - this is a display enhancement only, never load-bearing."""
+    if not os.path.exists(_OLLAMA_LOG_PATH):
+        return None
+    try:
+        # start_new_session=True puts `bash` (and the `tail`/`grep` it forks
+        # for the pipeline) in their own process group - required for
+        # _stop_prompt_progress_tail() to actually kill the whole pipeline.
+        # Verified empirically this was necessary: a plain proc.terminate()
+        # only signals the top-level `bash` process, leaving the piped
+        # `tail`/`grep` children orphaned and still running indefinitely.
+        return subprocess.Popen(
+            [
+                "bash", "-c",
+                f'tail -f -n0 "{_OLLAMA_LOG_PATH}" | grep --line-buffered "prompt processing"',
+            ],
+            stdout=None,  # inherited - writes straight to this terminal, no Python-side reading needed
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception:
+        return None
+
+
+def _stop_prompt_progress_tail(proc) -> None:
+    if proc is None:
+        return
+    import os as _os
+    import signal as _signal
+
+    try:
+        _os.killpg(_os.getpgid(proc.pid), _signal.SIGTERM)
+        proc.wait(timeout=2)
+    except Exception:
+        try:
+            _os.killpg(_os.getpgid(proc.pid), _signal.SIGKILL)
+        except Exception:
+            pass
+
 
 def _extract_real_stats(final_chunk: dict) -> str:
     """Build a short real-numbers summary from Ollama's actual final streamed
@@ -324,11 +432,15 @@ def _judge_episode_ollama(frames: list, task_description: str) -> JudgeResult:
         "keep_alive": _OLLAMA_KEEP_ALIVE,
     }
 
+    request_timeout = _estimate_ollama_request_timeout_s(len(frames))
+    tail_proc = _start_prompt_progress_tail()
+    if tail_proc is not None:
+        typer.echo("🔎 Prompt processing (live Ollama progress below)...")
     try:
         resp = requests.post(
             f"{_OLLAMA_API_BASE}/api/chat",
             json=payload,
-            timeout=_OLLAMA_INACTIVITY_TIMEOUT_S,
+            timeout=request_timeout,
             stream=True,
         )
         resp.raise_for_status()
@@ -341,6 +453,11 @@ def _judge_episode_ollama(frames: list, task_description: str) -> JudgeResult:
             for line in resp.iter_lines():
                 if not line:
                     continue
+                if tail_proc is not None:
+                    # First real byte means generation has started - the
+                    # silent prompt-processing phase this was watching is over.
+                    _stop_prompt_progress_tail(tail_proc)
+                    tail_proc = None
                 chunk = json.loads(line)
                 bar.update(1)
                 msg = chunk.get("message", {})
@@ -381,8 +498,9 @@ def _judge_episode_ollama(frames: list, task_description: str) -> JudgeResult:
         return JudgeResult(None, reason)
     except requests.exceptions.ReadTimeout:
         reason = (
-            f"Ollama produced no streamed output for {_OLLAMA_INACTIVITY_TIMEOUT_S:.0f}s - "
-            f"likely genuinely stuck, not just slow under real system load"
+            f"Ollama produced no streamed output for {request_timeout:.0f}s "
+            f"(scaled for {len(frames)} frames) - likely genuinely stuck, not "
+            f"just slow prompt processing under real system load"
         )
         typer.echo(f"⚠️  VLM judge: {reason}")
         return JudgeResult(None, reason)
@@ -390,6 +508,8 @@ def _judge_episode_ollama(frames: list, task_description: str) -> JudgeResult:
         reason = f"Ollama call failed: {e}"
         typer.echo(f"⚠️  VLM judge: {reason}")
         return JudgeResult(None, reason)
+    finally:
+        _stop_prompt_progress_tail(tail_proc)
 
 
 def preload_ollama_judge_model() -> bool:

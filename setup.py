@@ -34,6 +34,7 @@ setup(
         "websockets",
         "anthropic",
         "gradio",
+        "google-genai",
     ],
     extras_require={
         "dev": ["pytest", "black", "isort"],

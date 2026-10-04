@@ -619,16 +619,28 @@ def replay_mode(config: dict, auto_use: bool = False, replay_options: dict = Non
                                 from solo.commands.robots.lerobot.vlm_judge import (
                                     judge_episode, select_judge_frame_indices,
                                 )
-                                frame_indices = select_judge_frame_indices(
-                                    len(judge_camera_frames), perturbation_magnitudes=judge_perturb_magnitudes,
-                                )
+                                # Native-video backends (gemini) get the full
+                                # continuous episode - cheap for them, and far
+                                # more accurate for genuine temporal/moment-
+                                # finding reasoning than a sparse frame subset.
+                                # Frame-based backends (ollama/runpod) keep the
+                                # existing sparse, rubric-targeted selection to
+                                # keep their real per-call cost/latency low.
+                                judge_backend = os.environ.get("VLM_JUDGE_BACKEND", "ollama").strip().lower()
+                                if judge_backend == "gemini":
+                                    judge_frames = judge_camera_frames
+                                else:
+                                    frame_indices = select_judge_frame_indices(
+                                        len(judge_camera_frames), perturbation_magnitudes=judge_perturb_magnitudes,
+                                    )
+                                    judge_frames = [judge_camera_frames[i] for i in frame_indices]
                                 # judge_episode() (the Ollama backend specifically)
                                 # renders its own real tqdm progress bars and live
                                 # streamed text internally - no outer spinner needed
                                 # here, that would just duplicate/conflict with it.
                                 real_task = episode_task_lookup.get(ep) or judge_task
                                 result = judge_episode(
-                                    [judge_camera_frames[i] for i in frame_indices], task_description=real_task,
+                                    judge_frames, task_description=real_task, fps=fps,
                                 )
                                 # Fail CLOSED: an episode is only kept if the judge
                                 # explicitly says VALID. An explicit INVALID verdict

@@ -27,12 +27,30 @@ data-collection campaign, where per-call frontier-API token costs add up
 fast. The endpoint is true scale-to-zero (workersMin=0, idleTimeout=120s): no
 cost between data-collection sessions, but a real cold start on the first
 call of each new session - see _judge_episode_runpod()'s docstring for the
-measured real numbers. Worth revisiting once local quality/speed is proven
-insufficient for real use.
+measured real numbers.
+
+Gemini (set VLM_JUDGE_BACKEND=gemini) is a third, cloud/paid opt-in - Google's
+gemini-robotics-er-2-preview, built specifically for embodied/robotics video
+reasoning (real documented "moment finding" capability: identifies the exact
+frame a critical event occurs, used to "verify success"). After every
+Qwen-VL variant tested today (4B/7B/8B, both local Ollama and Runpod CUDA)
+failed on at least one of the two known adversarial test episodes in
+vlm_judge_test_fixtures/, this was the first backend to correctly judge BOTH -
+real evidence the Ollama/Runpod backends' independent-static-image serving
+(no temporal position encoding between frames - confirmed via a real, open
+llama.cpp GitHub issue for Qwen2.5/3-VL) is a genuine limitation this backend
+doesn't share, since it takes real native video input instead. Real cost is
+small (~$1/1M tokens, ~3,500 tokens/call measured) but non-zero and requires
+network access + a Google AI Studio API key (see get_google_api_key()) - not
+the default, since "local, free, no cloud dependency" was this file's whole
+design goal; this exists as a real fallback for when accuracy matters more
+than that goal for a given use case.
 
 (The original prototype also had an Anthropic Claude fallback backend; it was
 removed per explicit request to keep this file to only the backends actually
-in use - local Ollama now, Runpod later.)
+in use at the time - local Ollama, Runpod. Gemini was added later once it
+proved to be the first backend solving a real accuracy problem the other two
+couldn't.)
 """
 
 import base64
@@ -46,7 +64,9 @@ from io import BytesIO
 from typing import Optional
 
 import requests
+import tempfile
 import typer
+from rich.prompt import Prompt
 from tqdm import tqdm
 
 DEFAULT_JUDGE_TASK_DESCRIPTION = "Pick cup and place"
@@ -244,7 +264,7 @@ def _extract_rule_criterion_names(rules_text: str) -> list:
     return re.findall(r"\*\*(.+?)\*\*", rules_text)
 
 
-def _build_judge_prompt_text(task_description: str, num_frames: int) -> str:
+def _build_judge_prompt_text(task_description: str, num_frames: Optional[int]) -> str:
     # NOTE on thinking suppression: this used to need a trailing "/no_think"
     # directive here, because the original "qwen3-vl:4b" tag ALWAYS reasons
     # first regardless of request-time flags (see _OLLAMA_JUDGE_MODEL's real
@@ -283,10 +303,15 @@ def _build_judge_prompt_text(task_description: str, num_frames: int) -> str:
         f"(right side). The task involves picking an object and moving it between "
         f"these zones as described.\n"
         f"{rules_block}"
-        f"Below are {num_frames} frames from the episode, in chronological order: "
-        f"starting frame(s) first, then (if a perturbation-notable moment occurred "
-        f"mid-episode) one from the middle, then the final frame(s) showing the "
-        f"episode's end state last.\n\n"
+        + (
+            f"Below are {num_frames} frames from the episode, in chronological order: "
+            f"starting frame(s) first, then (if a perturbation-notable moment occurred "
+            f"mid-episode) one from the middle, then the final frame(s) showing the "
+            f"episode's end state last.\n\n"
+            if num_frames is not None
+            else "Below is the full video of the episode, in chronological order from "
+            "start to end.\n\n"
+        ) +
         f"Ground your judgment in what you LITERALLY SEE, not an assumption. "
         f"Before deciding, privately work out: (a) in the FIRST frame, which zone "
         f"- A (left) or B (right) - does the object actually occupy on the table? "
@@ -448,6 +473,31 @@ def get_runpod_api_key() -> str:
     from solo.commands.robots.lerobot.runpod_train import get_api_key
 
     return get_api_key()
+
+
+def get_google_api_key() -> str:
+    """Get a Google AI Studio API key from env, saved config, or prompt for it
+    once - same env/config/prompt-once-and-save pattern as get_runpod_api_key()
+    above (reuses runpod_train.py's _load_config()/_save_config() rather than
+    duplicating them), just under the "google" config key instead of
+    "runpod"."""
+    env_key = os.environ.get("GOOGLE_API_KEY")
+    if env_key:
+        return env_key
+
+    from solo.commands.robots.lerobot.runpod_train import _load_config, _save_config
+
+    config = _load_config()
+    key = config.get("google", {}).get("api_key")
+    if key:
+        return key
+
+    typer.echo("\n🔑 A Google AI Studio API key is required for the Gemini judge backend.")
+    typer.echo("   Create one at https://aistudio.google.com/apikey")
+    key = Prompt.ask("Enter your Google API key")
+    config.setdefault("google", {})["api_key"] = key
+    _save_config(config)
+    return key
 
 
 # Max gap between streamed chunks before treating the call as truly stuck
@@ -840,7 +890,123 @@ def _judge_episode_runpod(frames: list, task_description: str) -> JudgeResult:
         return JudgeResult(None, reason)
 
 
-def judge_episode(frames: list, task_description: str = DEFAULT_JUDGE_TASK_DESCRIPTION) -> JudgeResult:
+_GEMINI_JUDGE_MODEL = os.environ.get("GEMINI_JUDGE_MODEL", "gemini-robotics-er-2-preview")
+
+
+def _write_frames_to_temp_video(frames: list, fps: int) -> str:
+    """Write a list of (H, W, 3) uint8 RGB numpy frames to a temporary local
+    MP4, returning its path - the caller is responsible for deleting it.
+    Needed because replay.py only ever has in-memory frames for the episode
+    just replayed (the real video encoding for new_dataset doesn't happen
+    until save_episode(), which hasn't been decided yet at judge time) - there
+    is no pre-existing video FILE for this specific (possibly perturbed)
+    episode to upload directly, unlike the original source recording."""
+    import cv2
+
+    height, width = frames[0].shape[:2]
+    fd, path = tempfile.mkstemp(suffix=".mp4")
+    os.close(fd)
+    writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+    try:
+        for frame in frames:
+            # frames are RGB (same convention _frame_to_base64_jpeg assumes -
+            # PIL's Image.fromarray there works unconverted); cv2 writes BGR.
+            writer.write(cv2.cvtColor(frame.astype("uint8"), cv2.COLOR_RGB2BGR))
+    finally:
+        writer.release()
+    return path
+
+
+def _judge_episode_gemini(frames: list, task_description: str, fps: int = 30) -> JudgeResult:
+    """
+    Judge via Google's gemini-robotics-er-2-preview (Gemini API, cloud/paid -
+    see module docstring for cost/rationale). Real, measured result: the
+    first backend to correctly judge BOTH known adversarial test episodes in
+    vlm_judge_test_fixtures/ (episode_2.mp4 "Pick A to B", episode_3.mp4
+    "Pick B to A") after every Qwen-VL variant tried today (4B/7B/8B, local
+    Ollama and Runpod CUDA) failed on at least one of the two - full rubric
+    checklist PASS on both, ~27-31s per call, ~3,500 tokens/call.
+
+    Unlike the Ollama/Runpod backends (independent static images, no temporal
+    position encoding between them - a real, confirmed llama.cpp limitation
+    for Qwen2.5/3-VL), this backend takes NATIVE VIDEO via the Files API,
+    genuinely exercising this model's documented "moment finding" capability
+    (identifies the exact frame a critical event occurs - Google's own docs
+    frame this as how robots "verify success") across continuous motion
+    rather than discrete snapshots. `frames` here are written to a temporary
+    local MP4 first (see _write_frames_to_temp_video) since there is no
+    pre-existing video file for the just-replayed (possibly perturbed)
+    episode at judge time - only in-memory frames.
+
+    Opt-in via VLM_JUDGE_BACKEND=gemini. Requires the google-genai package and
+    a Google AI Studio API key (see get_google_api_key()).
+    """
+    if not frames:
+        typer.echo("⚠️  VLM judge: no frames to judge - could not verify.")
+        return JudgeResult(None, "no camera frames captured")
+
+    try:
+        from google import genai
+    except ImportError:
+        reason = "google-genai package not installed (pip install google-genai)"
+        typer.echo(f"⚠️  VLM judge: {reason}")
+        return JudgeResult(None, reason)
+
+    try:
+        api_key = get_google_api_key()
+    except Exception as e:
+        reason = f"could not get a Google API key: {e}"
+        typer.echo(f"⚠️  VLM judge: {reason}")
+        return JudgeResult(None, reason)
+
+    video_path = None
+    try:
+        typer.echo(f"📤 Encoding {len(frames)} frames into a video for {_GEMINI_JUDGE_MODEL}...")
+        video_path = _write_frames_to_temp_video(frames, fps)
+
+        client = genai.Client(api_key=api_key)
+        uploaded = client.files.upload(file=video_path)
+        # A just-uploaded video isn't immediately usable - the Files API
+        # processes it server-side first (PROCESSING -> ACTIVE/FAILED).
+        # Confirmed via a real 400 FAILED_PRECONDITION ("not in an ACTIVE
+        # state") when this poll was missing - a video upload genuinely needs
+        # this, unlike a plain image upload which tends to be active
+        # immediately.
+        deadline = time.monotonic() + 120.0
+        while uploaded.state == genai.types.FileState.PROCESSING and time.monotonic() < deadline:
+            time.sleep(2.0)
+            uploaded = client.files.get(name=uploaded.name)
+        if uploaded.state != genai.types.FileState.ACTIVE:
+            reason = f"Gemini file upload did not become ACTIVE in time (state={uploaded.state})"
+            typer.echo(f"⚠️  VLM judge: {reason}")
+            return JudgeResult(None, reason)
+
+        prompt_text = _build_judge_prompt_text(task_description, num_frames=None)
+
+        typer.echo(f"🔎 Judging via {_GEMINI_JUDGE_MODEL}...")
+        response = client.models.generate_content(
+            model=_GEMINI_JUDGE_MODEL,
+            contents=[uploaded, prompt_text],
+        )
+        verdict_text = (getattr(response, "text", None) or "").strip()
+        if not verdict_text:
+            reason = "Gemini returned no text content"
+            typer.echo(f"⚠️  VLM judge: {reason}")
+            return JudgeResult(None, reason)
+        return _parse_verdict(verdict_text)
+    except Exception as e:
+        reason = f"Gemini call failed: {e}"
+        typer.echo(f"⚠️  VLM judge: {reason}")
+        return JudgeResult(None, reason)
+    finally:
+        if video_path and os.path.exists(video_path):
+            try:
+                os.remove(video_path)
+            except Exception:
+                pass
+
+
+def judge_episode(frames: list, task_description: str = DEFAULT_JUDGE_TASK_DESCRIPTION, fps: int = 30) -> JudgeResult:
     """
     Judge whether a sequence of camera frames (list of (H, W, 3) uint8 numpy
     arrays, in chronological order) shows a valid completion of
@@ -859,9 +1025,16 @@ def judge_episode(frames: list, task_description: str = DEFAULT_JUDGE_TASK_DESCR
 
     Backend is local Ollama by default (free, no cold start, runs on this
     machine); set VLM_JUDGE_BACKEND=runpod for the Qwen2.5-VL Runpod
-    serverless path.
+    serverless path, or VLM_JUDGE_BACKEND=gemini for Google's
+    gemini-robotics-er-2-preview (cloud/paid, but the first backend to
+    correctly judge both known adversarial test episodes - see
+    _judge_episode_gemini()'s docstring). `fps` is only used by the gemini
+    backend (to reconstruct a temporary video from `frames` at the right
+    real playback rate); the frame-based backends ignore it.
     """
     backend = os.environ.get("VLM_JUDGE_BACKEND", "ollama").strip().lower()
     if backend == "runpod":
         return _judge_episode_runpod(frames, task_description)
+    if backend == "gemini":
+        return _judge_episode_gemini(frames, task_description, fps=fps)
     return _judge_episode_ollama(frames, task_description)

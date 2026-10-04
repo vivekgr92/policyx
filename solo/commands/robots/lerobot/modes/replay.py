@@ -624,7 +624,15 @@ def replay_mode(config: dict, auto_use: bool = False, replay_options: dict = Non
                             from lerobot.datasets.utils import build_dataset_frame
                             observation_frame = build_dataset_frame(new_dataset.features, obs, prefix=OBS_STR)
                             action_frame = build_dataset_frame(new_dataset.features, processed_action, prefix=ACTION)
-                            new_dataset.add_frame({**observation_frame, **action_frame, "task": task_description})
+                            # Use this episode's real recorded task (e.g. "Pick A
+                            # to B" vs "Pick B to A" in an alternating --loop
+                            # source dataset) instead of the single static
+                            # task_description entered once at session start -
+                            # same real per-episode lookup already used for the
+                            # judge's input (see episode_task_lookup above), now
+                            # applied to what actually gets written/saved too.
+                            saved_task = episode_task_lookup.get(ep) or task_description
+                            new_dataset.add_frame({**observation_frame, **action_frame, "task": saved_task})
 
                         precise_sleep(1 / fps - (time.perf_counter() - start_t))
 

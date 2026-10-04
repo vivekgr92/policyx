@@ -170,6 +170,7 @@ def replay_mode(config: dict, auto_use: bool = False, replay_options: dict = Non
         vlm_judge = bool(replay_options.get('vlm_judge') or False)
         from solo.commands.robots.lerobot.vlm_judge import DEFAULT_JUDGE_TASK_DESCRIPTION
         judge_task = replay_options.get('judge_task') or DEFAULT_JUDGE_TASK_DESCRIPTION
+        judge_backend = replay_options.get('judge_backend') or "gemini"
         camera_config = replay_options.get('camera_config')
         if camera_config is None:
             # No cameras passed on the CLI (there's no flag for that) - fall back
@@ -201,6 +202,7 @@ def replay_mode(config: dict, auto_use: bool = False, replay_options: dict = Non
             vlm_judge = bool(preconfigured.get('vlm_judge') or False)
             from solo.commands.robots.lerobot.vlm_judge import DEFAULT_JUDGE_TASK_DESCRIPTION
             judge_task = preconfigured.get('judge_task') or DEFAULT_JUDGE_TASK_DESCRIPTION
+            judge_backend = preconfigured.get('judge_backend') or "gemini"
             camera_config = preconfigured.get('camera_config')
         else:
             # Get robot config
@@ -282,6 +284,7 @@ def replay_mode(config: dict, auto_use: bool = False, replay_options: dict = Non
             vlm_judge = False
             from solo.commands.robots.lerobot.vlm_judge import DEFAULT_JUDGE_TASK_DESCRIPTION
             judge_task = DEFAULT_JUDGE_TASK_DESCRIPTION
+            judge_backend = "gemini"
             if Confirm.ask(
                 "\nAlso save this replay as new recorded episode(s) (with live camera capture) "
                 "for building up more training data?",
@@ -306,6 +309,20 @@ def replay_mode(config: dict, auto_use: bool = False, replay_options: dict = Non
                     default=False,
                 )
                 if vlm_judge:
+                    # gemini is the default: it's the only backend that reliably
+                    # passed both known-adversarial test episodes today (native
+                    # video + real temporal reasoning), while ollama's local
+                    # Qwen-VL has a confirmed architectural gap (independent
+                    # static frames, no real temporal encoding between them).
+                    # ollama stays offered since it's free/local and still works
+                    # for less ambiguous cases; runpod remains available only
+                    # via the VLM_JUDGE_BACKEND=runpod env var directly, not
+                    # surfaced here.
+                    judge_backend = Prompt.ask(
+                        "Which VLM judge backend?",
+                        choices=["gemini", "ollama"],
+                        default="gemini",
+                    )
                     judge_task = clean_ansi_codes(Prompt.ask(
                         "Task description for the judge to evaluate against",
                         default=DEFAULT_JUDGE_TASK_DESCRIPTION,
@@ -323,7 +340,7 @@ def replay_mode(config: dict, auto_use: bool = False, replay_options: dict = Non
                 'save_replay_as': save_replay_as, 'camera_config': camera_config,
                 'save_replay_resume': save_replay_resume, 'repeat': repeat_count, 'perturb': perturb,
                 'perturb_increment': perturb_increment, 'loop': loop, 'vlm_judge': vlm_judge,
-                'judge_task': judge_task,
+                'judge_task': judge_task, 'judge_backend': judge_backend,
             })
 
     # Import lerobot components
@@ -400,7 +417,7 @@ def replay_mode(config: dict, auto_use: bool = False, replay_options: dict = Non
                 'save_replay_as': save_replay_as, 'camera_config': camera_config,
                 'save_replay_resume': save_replay_resume, 'repeat': repeat_count, 'perturb': perturb,
                 'perturb_increment': perturb_increment, 'loop': loop, 'vlm_judge': vlm_judge,
-                'judge_task': judge_task,
+                'judge_task': judge_task, 'judge_backend': judge_backend,
             })
 
         task_description = None
@@ -509,6 +526,15 @@ def replay_mode(config: dict, auto_use: bool = False, replay_options: dict = Non
                 home_limits = load_joint_limits(robot_type, follower_id)
             except Exception as e:
                 typer.echo(f"⚠️  Could not load joint limits to return to rest position: {e}")
+
+        if vlm_judge:
+            # Authoritative for this session: the interactive choice (or the
+            # CLI/preconfigured judge_backend, both resolved above) overrides
+            # whatever VLM_JUDGE_BACKEND was already set in the environment -
+            # runpod remains reachable only by setting that env var directly
+            # and skipping this prompt entirely (CLI-args path with no
+            # judge_backend passed still defaults to "gemini", never runpod).
+            os.environ["VLM_JUDGE_BACKEND"] = judge_backend
 
         if vlm_judge and os.environ.get("VLM_JUDGE_BACKEND", "ollama").strip().lower() == "ollama":
             from solo.commands.robots.lerobot.vlm_judge import preload_ollama_judge_model
@@ -723,6 +749,7 @@ def replay_mode(config: dict, auto_use: bool = False, replay_options: dict = Non
                                     'repeat': repeat_count, 'perturb': perturb,
                                     'perturb_increment': perturb_increment, 'loop': loop,
                                     'vlm_judge': vlm_judge, 'judge_task': judge_task,
+                                    'judge_backend': judge_backend,
                                 })
 
                                 follower_config = _build_follower_config(follower_port)

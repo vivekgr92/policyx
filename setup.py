@@ -35,6 +35,12 @@ setup(
         "anthropic",
         "gradio",
         "google-genai",
+        "ikpy",
+        "pupil-apriltags",
+        "opencv-python",
+        "h5py",
+        "scipy",
+        "pandas",
     ],
     extras_require={
         "dev": ["pytest", "black", "isort"],

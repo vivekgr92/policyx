@@ -92,26 +92,21 @@ from solo.commands.robots.lerobot.sim_augmentation.so101_fk import compute_gripp
 DEFAULT_GRASP_THRESHOLD_PCT = 30.0
 
 
-def _episode_video_path(dataset_root: Path, episode_index: int, camera_key: str) -> Path:
-    """Real LeRobot v3 per-episode video path. LeRobot v3 can pack multiple
-    episodes into one physical mp4 per (camera, chunk, file) -- this does NOT
-    yet handle that case (confirmed NOT needed for vivekgr92/lerobot-dataset:
-    10 episodes, 10 separate video files, file-NNN.mp4 == episode NNN). Fails
-    loudly rather than silently guessing if that direct mapping doesn't hold
-    for a different dataset."""
-    direct = dataset_root / "videos" / camera_key / "chunk-000" / f"file-{episode_index:03d}.mp4"
-    if direct.is_file():
-        return direct
-    video_dir = dataset_root / "videos" / camera_key
-    candidates = sorted(video_dir.glob("chunk-*/file-*.mp4"))
-    if len(candidates) == 1:
-        return candidates[0]
-    raise FileNotFoundError(
-        f"Could not resolve a video file for episode {episode_index}, camera '{camera_key}' under "
-        f"{video_dir}. Direct path {direct} is missing and {len(candidates)} video files exist -- "
-        "this dataset likely packs multiple episodes per video file, which this script does not "
-        f"yet handle. Candidates found: {[str(c) for c in candidates]}"
+def _episode_video_path(dataset_root: Path, episode_index: int, camera_key: str, segment: dict) -> Path:
+    """Real LeRobot v3 per-episode video path, from the real chunk_index/
+    file_index recorded in this episode's own metadata (meta/episodes/*.parquet)
+    -- NOT guessed from the episode index. LeRobot v3 can (and, confirmed on a
+    real dataset -- vivekgr92/tags episodes 0 and 1 -- does) pack multiple
+    episodes into one physical mp4 per (camera, chunk, file); `segment`'s
+    from_timestamp/to_timestamp (see detect_object_poses_in_video's
+    start_time_s/end_time_s) is what slices out just this episode's frames."""
+    path = (
+        dataset_root / "videos" / camera_key
+        / f"chunk-{segment['chunk_index']:03d}" / f"file-{segment['file_index']:03d}.mp4"
     )
+    if not path.is_file():
+        raise FileNotFoundError(f"Episode {episode_index}'s video file does not exist: {path}")
+    return path
 
 
 def _compute_eef_poses(frames: pd.DataFrame, joint_names: list[str]) -> np.ndarray:
@@ -135,26 +130,66 @@ def _compute_grasped_signal(
     gripper_action: np.ndarray,
     grasp_threshold_pct: float,
 ) -> tuple[np.ndarray, Optional[str]]:
-    """Returns (signal [T,1] float32, active_object_name). active_object_name
-    is None if the gripper never closes past threshold in this episode --
-    callers should treat that as a suspect episode (all-zero signal will
-    likely fail isaaclab_mimic's monotonic-boundary check), not a silently
-    accepted one."""
+    """Returns (signal [T,1] float32, active_object_name).
+
+    Detects EVERY grasp/release cycle (contiguous closed segment), not just
+    the first -- a real recorded dataset (vivekgr92/tags) confirmed, by
+    direct user confirmation, that episodes deliberately contain multiple
+    pick-and-place cycles. The earlier "latch forever after first dip below
+    threshold" version produced a signal stuck at 1.0 for the entire rest of
+    the episode after the first close, which is wrong for this real case --
+    the signal now goes back to 0.0 whenever the gripper reopens, correctly
+    reflecting repeated grasp/release.
+
+    active_object_name is None if the gripper never closes past threshold
+    (suspect episode -- an all-zero signal will likely fail isaaclab_mimic's
+    monotonic-boundary check). If different grasp segments are nearest to
+    DIFFERENT objects (switching which object is picked within one episode),
+    the majority-voted object is returned but this is flagged loudly to the
+    caller via the echoed warning, since the current schema (one object_ref
+    per subtask) can't represent a per-segment-varying target -- a real,
+    not-yet-solved limitation for that specific case, not silently hidden."""
     T = eef_pose.shape[0]
-    closed_frames = np.nonzero(gripper_action.reshape(-1) < grasp_threshold_pct)[0]
-    if len(closed_frames) == 0:
+    is_closed = gripper_action.reshape(-1) < grasp_threshold_pct
+    if not is_closed.any():
         return np.zeros((T, 1), dtype=np.float32), None
 
-    first_closed = int(closed_frames[0])
-    gripper_pos_at_grasp = eef_pose[first_closed][:3, 3]
-    active_name, best_dist = None, None
-    for name, poses in object_poses.items():
-        dist = float(np.linalg.norm(poses[first_closed][:3, 3] - gripper_pos_at_grasp))
-        if best_dist is None or dist < best_dist:
-            best_dist, active_name = dist, name
+    # Contiguous closed segments = individual grasp events.
+    edges = np.diff(is_closed.astype(np.int8))
+    starts = list(np.nonzero(edges == 1)[0] + 1)
+    if is_closed[0]:
+        starts = [0] + starts
+    ends = list(np.nonzero(edges == -1)[0] + 1)
+    if is_closed[-1]:
+        ends = ends + [T]
+    segments = list(zip(starts, ends))
 
     signal = np.zeros((T, 1), dtype=np.float32)
-    signal[first_closed:] = 1.0
+    segment_objects = []
+    for seg_start, seg_end in segments:
+        signal[seg_start:seg_end] = 1.0
+        gripper_pos = eef_pose[seg_start][:3, 3]
+        best_name, best_dist = None, None
+        for name, poses in object_poses.items():
+            dist = float(np.linalg.norm(poses[seg_start][:3, 3] - gripper_pos))
+            if best_dist is None or dist < best_dist:
+                best_dist, best_name = dist, name
+        segment_objects.append(best_name)
+
+    distinct = set(segment_objects)
+    if len(distinct) > 1:
+        import collections
+
+        counts = collections.Counter(segment_objects)
+        active_name = counts.most_common(1)[0][0]
+        typer.echo(
+            f"⚠️  {len(segments)} grasp segments nearest to DIFFERENT objects {dict(counts)} -- "
+            f"using majority '{active_name}'. The current HDF5 schema assumes one object per "
+            "episode; a per-segment-varying target isn't represented here."
+        )
+    else:
+        active_name = segment_objects[0] if segment_objects else None
+
     return signal, active_name
 
 
@@ -174,8 +209,13 @@ def export_episode(
     eef_pose = _compute_eef_poses(frames, joint_names)
     target_eef_pose = _compute_target_eef_pose(eef_pose)
 
-    video_path = _episode_video_path(dataset.root, episode_index, camera_key)
-    object_poses = detect_object_poses_in_video(str(video_path), camera_angle, name_to_tag_id, tag_sizes_m)
+    ep_info = dataset.episode(episode_index)
+    segment = ep_info.video_segment(camera_key)
+    video_path = _episode_video_path(dataset.root, episode_index, camera_key, segment)
+    object_poses = detect_object_poses_in_video(
+        str(video_path), camera_angle, name_to_tag_id, tag_sizes_m,
+        start_time_s=segment["from_timestamp"], end_time_s=segment["to_timestamp"],
+    )
     for name, poses in object_poses.items():
         if poses.shape[0] != actions.shape[0]:
             raise ValueError(
@@ -255,7 +295,7 @@ def export(
     episodes: str = typer.Option("all", help="Episode selector: 'all', '0,2,5', '0-3', or a mix."),
     camera_key: str = typer.Option("observation.images.front", help="LeRobot dataset video feature key."),
     camera_angle: str = typer.Option("front", help="Camera calibration label (see camera_calibration.py / hand_eye_calibration.py)."),
-    tag_size_mm: float = typer.Option(25.0, help="Physical AprilTag size in mm, same for all tracked objects."),
+    tag_size_mm: float = typer.Option(15.0, help="Physical AprilTag size in mm, same for all tracked objects (real printed cup tags are 15mm)."),
     grasp_threshold_pct: float = typer.Option(DEFAULT_GRASP_THRESHOLD_PCT, help="Recorded gripper value below which the gripper is considered closed/grasping."),
     env_name: str = typer.Option("so101_pick_place", help="env_name recorded in the HDF5 env_args (cosmetic, robomimic convention)."),
 ):

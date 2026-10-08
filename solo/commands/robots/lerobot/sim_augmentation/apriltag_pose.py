@@ -92,13 +92,13 @@ app = typer.Typer(help="AprilTag generation + object-pose extraction for the Mim
 @app.command("generate")
 def cmd_generate(
     output_dir: str = typer.Option("~/.solo/apriltags", help="Directory to save generated tag images."),
-    tag_ids: str = typer.Option("0,1,2", help="Comma-separated tag IDs to generate."),
+    tag_ids: str = typer.Option("0,1,2,3", help="Comma-separated tag IDs to generate."),
     tag_family: str = typer.Option("tag36h11", help="AprilTag family."),
     size_mm: float = typer.Option(30.0, help="Physical size of the tag's own black-bordered square, in mm."),
     dpi: int = typer.Option(300, help="Print resolution."),
 ):
     """Generate printable AprilTag images, e.g. for cup A (ID 0), cup B (ID 1),
-    and the gripper calibration target (ID 2)."""
+    cup C (ID 2), and the gripper calibration target (ID 3)."""
     output_dir = os.path.expanduser(output_dir)
     ids = [int(x.strip()) for x in tag_ids.split(",") if x.strip()]
     for tag_id in ids:
@@ -138,13 +138,24 @@ def detect_object_poses_in_video(
     video_path: str,
     camera_angle: str,
     name_to_tag_id: dict[str, int],
-    tag_sizes_m: "dict[str, float] | float" = 0.025,
+    tag_sizes_m: "dict[str, float] | float" = 0.015,  # real printed cup tags are 15mm
     tag_family: str = "tag36h11",
+    start_time_s: Optional[float] = None,
+    end_time_s: Optional[float] = None,
 ) -> dict[str, np.ndarray]:
     """
     Detect AprilTags over every frame of `video_path`, transform each
     detection from camera frame to robot-base frame via the real hand-eye
     extrinsics, and return {object_name: [T,4,4] poses in base frame}.
+
+    `start_time_s`/`end_time_s` (both optional, default = whole video) slice
+    out just one episode's frames when `video_path` is a SHARED file packing
+    multiple episodes -- real confirmed case on a real dataset
+    (vivekgr92/tags: episodes 0 and 1 share one mp4, with real
+    from_timestamp/to_timestamp recorded per episode in its own metadata).
+    Without this, every episode sharing a file would read the WHOLE file
+    (wrong frame count, silently misaligned against that episode's own
+    recorded actions) -- see mimic_hdf5_export.py's _episode_video_path.
 
     Frames where a tag isn't detected (occlusion, typically during grasp)
     are filled by `_interpolate_gaps` -- SLERP for rotation, linear for
@@ -174,11 +185,19 @@ def detect_object_poses_in_video(
     if not cap.isOpened():
         raise RuntimeError(f"Could not open video: {video_path}")
 
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    start_frame = int(round(start_time_s * fps)) if start_time_s is not None else 0
+    end_frame = int(round(end_time_s * fps)) if end_time_s is not None else None
+    if start_frame > 0:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+
     raw_poses: dict[str, list[Optional[np.ndarray]]] = {name: [] for name in name_to_tag_id}
     new_camera_matrix = None
     frame_count = 0
     try:
         while True:
+            if end_frame is not None and start_frame + frame_count >= end_frame:
+                break
             ret, frame = cap.read()
             if not ret:
                 break

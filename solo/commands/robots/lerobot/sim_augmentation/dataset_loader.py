@@ -27,6 +27,22 @@ class EpisodeInfo:
     episode_index: int
     task: str
     length: int
+    # Per-camera video location: camera_key -> {chunk_index, file_index,
+    # from_timestamp, to_timestamp}. LeRobot v3 can pack multiple episodes
+    # into one physical mp4 per (camera, chunk, file) -- real confirmed case:
+    # vivekgr92/tags episodes 0 and 1 share chunk-000/file-000.mp4 (1198 +
+    # 916 = 2114 frames, matching the file's real total frame count). This
+    # is how a caller resolves the exact file AND the exact frame range
+    # within it for a given episode, rather than assuming 1 file == 1 episode.
+    video_segments: dict = None
+
+    def video_segment(self, camera_key: str) -> dict:
+        if not self.video_segments or camera_key not in self.video_segments:
+            raise KeyError(
+                f"No video segment metadata for camera '{camera_key}' on episode {self.episode_index} "
+                f"(available: {list((self.video_segments or {}).keys())})"
+            )
+        return self.video_segments[camera_key]
 
 
 @dataclass
@@ -119,19 +135,36 @@ def resolve_dataset(dataset: str, cache_dir: Optional[str] = None) -> LeRobotDat
     episode_files = sorted((root / "meta" / "episodes").glob("chunk-*/file-*.parquet"))
     ep_rows = []
     for f in episode_files:
-        edf = pd.read_parquet(f, columns=["episode_index", "tasks", "length"])
+        # Read all columns here (not just episode_index/tasks/length) -- the
+        # per-camera video chunk/file/timestamp columns are named dynamically
+        # per camera_key ("videos/<camera_key>/chunk_index" etc.) so we can't
+        # list them upfront; parsed out below instead.
+        edf = pd.read_parquet(f)
         ep_rows.append(edf)
     episodes_df = pd.concat(ep_rows, ignore_index=True).sort_values("episode_index")
+
+    video_col_re = re.compile(r"^videos/(.+)/(chunk_index|file_index|from_timestamp|to_timestamp)$")
+    camera_keys = {m.group(1) for c in episodes_df.columns if (m := video_col_re.match(c))}
 
     episodes = []
     for _, row in episodes_df.iterrows():
         task_list = list(row["tasks"]) if row["tasks"] is not None else []
         task = str(task_list[0]) if len(task_list) > 0 else ""
+        video_segments = {
+            cam: {
+                "chunk_index": int(row[f"videos/{cam}/chunk_index"]),
+                "file_index": int(row[f"videos/{cam}/file_index"]),
+                "from_timestamp": float(row[f"videos/{cam}/from_timestamp"]),
+                "to_timestamp": float(row[f"videos/{cam}/to_timestamp"]),
+            }
+            for cam in camera_keys
+        }
         episodes.append(
             EpisodeInfo(
                 episode_index=int(row["episode_index"]),
                 task=task,
                 length=int(row["length"]),
+                video_segments=video_segments,
             )
         )
 

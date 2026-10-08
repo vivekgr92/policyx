@@ -67,6 +67,20 @@ DEFAULT_DPI = 300
 DEFAULT_NUM_IMAGES = 25
 
 
+# Applied at the frame-read SOURCE (not just the preview window) so the
+# saved video/images match reality - what matters for the downstream
+# pipeline (AprilTag poses, hand-eye calibration) is correct saved data,
+# not just a correct-looking live preview.
+_FLIP_CODES = {"none": None, "horizontal": 1, "vertical": 0, "both": -1}
+
+
+def _apply_flip(frame: np.ndarray, flip: str) -> np.ndarray:
+    import cv2
+
+    code = _FLIP_CODES.get(flip)
+    return frame if code is None else cv2.flip(frame, code)
+
+
 def _pattern_size(squares_x: int, squares_y: int) -> Tuple[int, int]:
     """cv2's chessboard functions key on internal corner count, not square
     count - a 10x7-square board has 9x6 internal corners."""
@@ -93,9 +107,14 @@ def generate_checkerboard_pattern(
     board_w = squares_x * square_px
     board_h = squares_y * square_px
 
-    margin = square_px
-    header_h = square_px  # room for the instruction label above the board
-    footer_h = int(square_px * 0.8)  # room for the ruler/scale bar below
+    # Fixed small mm paddings, NOT tied to square_px - with large squares/grids
+    # (e.g. 9x7 @ 25.4mm = 228.6x177.8mm board alone), margin=square_px would
+    # push the total page past A4 (210x297mm) in every orientation. Fixed
+    # ~5-12mm paddings keep real-world boards printable on standard paper
+    # while still leaving room for the label/scale-bar.
+    margin = int(round(5.0 * px_per_mm))
+    header_h = int(round(10.0 * px_per_mm))  # room for the instruction label above the board
+    footer_h = int(round(8.0 * px_per_mm))  # room for the ruler/scale bar below
 
     img_h = header_h + board_h + footer_h + 2 * margin
     img_w = board_w + 2 * margin
@@ -264,6 +283,9 @@ def _print_quality_report(result: dict) -> None:
     )
 
 
+_CAPTURE_INTERVAL_S = 10.0
+
+
 def capture_calibration_images(
     output_dir: str,
     camera_id: Optional[int] = None,
@@ -271,12 +293,23 @@ def capture_calibration_images(
     squares_x: int = DEFAULT_SQUARES_X,
     squares_y: int = DEFAULT_SQUARES_Y,
     label: Optional[str] = None,
+    flip: str = "horizontal",
 ) -> Tuple[str, List[str]]:
-    """Live capture loop: SPACE saves the current frame (only when the board
-    is actually detected in it - no point saving a frame calibrateCamera
-    will just skip later), Q/Esc finishes early. Reuses this project's own
-    camera detection rather than guessing an OpenCV index, same pattern as
+    """Live capture loop: counts down `_CAPTURE_INTERVAL_S` seconds (shown
+    both as a terminal line and a big on-screen overlay) between each
+    capture, so you know exactly when to hold the board still and when the
+    shot will actually fire - a fixed, predictable rhythm rather than the
+    earlier "auto-save whenever detected + short cooldown" approach, which
+    could still fire mid-motion. NOT gated on a SPACE keypress, since
+    cv2.imshow's keyboard focus is unreliable on macOS when launched from a
+    terminal (confirmed in practice: a user reported neither SPACE nor Q
+    registering even after clicking the preview window). Ctrl-C in the
+    terminal (not the GUI window) is the reliable way to stop early - that
+    always works, window focus or not. Reuses this project's own camera
+    detection rather than guessing an OpenCV index, same pattern as
     vlm_judge_playground.py's _pick_camera_index()."""
+    import time
+
     import cv2
 
     if camera_id is None:
@@ -297,31 +330,56 @@ def capture_calibration_images(
     if not cap.isOpened():
         raise RuntimeError(f"Could not open camera index {camera_id}.")
 
-    typer.echo("Move the checkerboard to vary angle/distance/tilt. SPACE = capture, Q = finish.")
+    typer.echo(
+        f"Move the checkerboard to a new angle/distance/tilt, then hold it STILL - a capture "
+        f"fires every {_CAPTURE_INTERVAL_S:.0f}s (countdown shown below and on-screen). Press "
+        "Ctrl-C in THIS TERMINAL to stop early."
+    )
     saved: List[str] = []
+    next_capture_t = time.monotonic() + _CAPTURE_INTERVAL_S
+    last_shown_secs = None
     try:
         while len(saved) < num_target:
             ret, frame = cap.read()
             if not ret:
                 continue
+            frame = _apply_flip(frame, flip)
             found, corners, _ = find_corners_in_image(frame, pattern_size)
+
+            remaining = max(0.0, next_capture_t - time.monotonic())
+            remaining_secs = int(remaining) + 1 if remaining > 0 else 0
 
             display = frame.copy()
             if found:
                 cv2.drawChessboardCorners(display, pattern_size, corners, found)
-            status = f"Captured: {len(saved)}/{num_target}  corners_found={found}"
+            status = f"Captured: {len(saved)}/{num_target}  corners_found={found}  next capture in {remaining_secs}s"
             color = (0, 255, 0) if found else (0, 0, 255)
             cv2.putText(display, status, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-            cv2.imshow("Camera calibration capture", display)
+            cv2.putText(
+                display, str(remaining_secs), (display.shape[1] - 90, 80),
+                cv2.FONT_HERSHEY_SIMPLEX, 2.0, (0, 255, 255), 4,
+            )
+            cv2.imshow("Camera calibration capture (Ctrl-C in terminal to stop)", display)
+            cv2.waitKey(1)  # pumps the GUI event loop so the window actually renders/updates
 
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord(" ") and found:
-                path = os.path.join(output_dir, f"calib_{label}_{len(saved):03d}.png")
-                cv2.imwrite(path, frame)
-                saved.append(path)
-                typer.echo(f"✅ Captured {path} ({len(saved)}/{num_target})")
-            elif key in (ord("q"), 27):
-                break
+            if remaining_secs != last_shown_secs:
+                print(f"\r⏳ Next capture in {remaining_secs:2d}s... ", end="", flush=True)
+                last_shown_secs = remaining_secs
+
+            if time.monotonic() >= next_capture_t:
+                print()  # end the countdown line
+                if found:
+                    path = os.path.join(output_dir, f"calib_{label}_{len(saved):03d}.png")
+                    cv2.imwrite(path, frame)
+                    saved.append(path)
+                    typer.echo(f"✅ Captured {path} ({len(saved)}/{num_target})")
+                else:
+                    typer.echo("⚠️  Board not detected at the 0s mark - skipped, timer reset.")
+                next_capture_t = time.monotonic() + _CAPTURE_INTERVAL_S
+                last_shown_secs = None
+    except KeyboardInterrupt:
+        print()
+        typer.echo(f"🛑 Stopped early with {len(saved)}/{num_target} captured.")
     finally:
         cap.release()
         cv2.destroyAllWindows()
@@ -329,7 +387,213 @@ def capture_calibration_images(
     return label, saved
 
 
+def record_calibration_video(
+    output_path: str,
+    camera_id: Optional[int] = None,
+    fps: int = 30,
+    flip: str = "horizontal",
+) -> str:
+    """Just records raw video, no detection/GUI-keypress logic at all - the
+    most robust capture path, since it only depends on Ctrl-C in the
+    terminal (always reliable) rather than cv2's keyboard focus (confirmed
+    unreliable in practice on this setup - see capture_calibration_images's
+    docstring). Move the checkerboard around while this runs; frames get
+    extracted and corner-checked afterward by extract_frames_from_video."""
+    import cv2
+
+    if camera_id is None:
+        from solo.commands.robots.lerobot.cameras import find_available_cameras
+
+        cameras = find_available_cameras()
+        if not cameras:
+            raise RuntimeError("No cameras detected (checked OpenCV + RealSense).")
+        camera_id = cameras[0].get("id", 0)
+        typer.echo(f"📷 Using camera: {cameras[0].get('type', 'Unknown')} (ID: {camera_id})")
+
+    cap = cv2.VideoCapture(camera_id)
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open camera index {camera_id}.")
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    output_path = os.path.expanduser(output_path)
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)) or ".", exist_ok=True)
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(output_path, fourcc, fps, (w, h))
+
+    typer.echo(
+        f"🔴 Recording to {output_path} ({w}x{h} @ {fps}fps, flip={flip}). Slowly move the checkerboard "
+        "through varied angles/distances/tilts, covering the whole frame over time. Press Ctrl-C in "
+        "THIS TERMINAL when done."
+    )
+    frame_count = 0
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                continue
+            frame = _apply_flip(frame, flip)
+            writer.write(frame)
+            frame_count += 1
+            cv2.putText(
+                frame, f"REC  {frame_count / fps:5.1f}s  (Ctrl-C in terminal to stop)",
+                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2,
+            )
+            cv2.imshow("Recording calibration video", frame)
+            cv2.waitKey(1)  # pumps the GUI event loop so the window actually renders/updates
+    except KeyboardInterrupt:
+        typer.echo(f"\n🛑 Stopped after {frame_count} frames ({frame_count / fps:.1f}s).")
+    finally:
+        cap.release()
+        writer.release()
+        cv2.destroyAllWindows()
+
+    return output_path
+
+
+def extract_frames_from_video(
+    video_path: str,
+    output_dir: str,
+    squares_x: int = DEFAULT_SQUARES_X,
+    squares_y: int = DEFAULT_SQUARES_Y,
+    num_target: int = DEFAULT_NUM_IMAGES,
+    label: Optional[str] = None,
+    min_frame_gap: int = 10,
+) -> Tuple[str, List[str]]:
+    """Scans every frame of a recorded video for checkerboard corners, and
+    saves up to num_target of the detected-good ones as calibration images -
+    spaced at least min_frame_gap frames apart so they're genuinely varied
+    views, not 10 near-identical consecutive frames from holding the board
+    still for a moment."""
+    import cv2
+
+    video_path = os.path.expanduser(video_path)
+    output_dir = os.path.expanduser(output_dir)
+    os.makedirs(output_dir, exist_ok=True)
+    label = label or "front"
+    pattern_size = _pattern_size(squares_x, squares_y)
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video: {video_path}")
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    saved: List[str] = []
+    frame_idx = 0
+    last_saved_idx = -min_frame_gap
+    typer.echo(f"🔍 Scanning {total_frames} frames for checkerboard corners...")
+    from tqdm import tqdm
+
+    pbar = tqdm(total=total_frames, unit="frame", desc="Scanning", postfix={"found": 0})
+    try:
+        while len(saved) < num_target:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            frame_idx += 1
+            pbar.update(1)
+            if frame_idx - last_saved_idx < min_frame_gap:
+                continue
+            found, _, _ = find_corners_in_image(frame, pattern_size)
+            if found:
+                path = os.path.join(output_dir, f"calib_{label}_{len(saved):03d}.png")
+                cv2.imwrite(path, frame)
+                saved.append(path)
+                last_saved_idx = frame_idx
+                pbar.set_postfix({"found": f"{len(saved)}/{num_target}"})
+                tqdm.write(f"✅ Frame {frame_idx}/{total_frames}: captured ({len(saved)}/{num_target})")
+    finally:
+        pbar.close()
+        cap.release()
+
+    typer.echo(f"Extracted {len(saved)}/{num_target} usable frames from {frame_idx} scanned.")
+    return label, saved
+
+
 app = typer.Typer(help="Camera intrinsics calibration for the AprilTag object-pose pipeline.")
+
+
+@app.command("debug-frame")
+def cmd_debug_frame(
+    output: str = typer.Option("~/Desktop/calib_debug_frame.png", help="Where to save the raw frame."),
+    camera_id: Optional[int] = typer.Option(None, help="OpenCV camera index; auto-detected if omitted."),
+    squares_x: int = DEFAULT_SQUARES_X,
+    squares_y: int = DEFAULT_SQUARES_Y,
+):
+    """Grab ONE raw frame and save it regardless of corner detection, plus try
+    detection with both the normal (fast) flags and a slower, more lenient
+    pass - for diagnosing why `capture` reports corners_found=False on every
+    frame, since that can't be debugged blind without seeing a real frame."""
+    import cv2
+
+    if camera_id is None:
+        from solo.commands.robots.lerobot.cameras import find_available_cameras
+
+        cameras = find_available_cameras()
+        if not cameras:
+            typer.echo("❌ No cameras detected.")
+            raise typer.Exit(1)
+        camera_id = cameras[0].get("id", 0)
+        typer.echo(f"📷 Using camera: {cameras[0].get('type', 'Unknown')} (ID: {camera_id})")
+
+    cap = cv2.VideoCapture(camera_id)
+    if not cap.isOpened():
+        typer.echo(f"❌ Could not open camera index {camera_id}.")
+        raise typer.Exit(1)
+    # Let auto-exposure/focus settle before grabbing the real frame - a
+    # frame-count-only warmup can finish in milliseconds if reads are fast,
+    # which isn't enough real wall-clock time for some cameras' auto-exposure
+    # hardware to actually adjust, so this also sleeps briefly between reads.
+    import time as _time
+
+    for _ in range(30):
+        cap.read()
+        _time.sleep(0.05)
+    ret, frame = cap.read()
+    cap.release()
+    if not ret:
+        typer.echo("❌ Could not read a frame from the camera.")
+        raise typer.Exit(1)
+
+    mean_brightness = float(frame.mean())
+    if mean_brightness < 10.0:
+        typer.echo(
+            f"⚠️  Frame is nearly pure black (mean brightness {mean_brightness:.1f}/255) - this isn't "
+            "a detection issue, the camera isn't seeing anything. Check the room lights and that "
+            "nothing is covering/blocking the lens."
+        )
+
+    output = os.path.expanduser(output)
+    os.makedirs(os.path.dirname(os.path.abspath(output)) or ".", exist_ok=True)
+    cv2.imwrite(output, frame)
+    typer.echo(f"💾 Saved raw frame to {output} ({frame.shape[1]}x{frame.shape[0]})")
+
+    pattern_size = _pattern_size(squares_x, squares_y)
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+    found_fast, corners_fast = cv2.findChessboardCorners(
+        gray, pattern_size,
+        flags=cv2.CALIB_CB_ADAPTIVE_THRESH + cv2.CALIB_CB_NORMALIZE_IMAGE + cv2.CALIB_CB_FAST_CHECK,
+    )
+    typer.echo(f"🔍 Fast detection (same as `capture`): corners_found={found_fast}")
+
+    found_slow, corners_slow = cv2.findChessboardCorners(
+        gray, pattern_size, flags=cv2.CALIB_CB_ADAPTIVE_THRESH + cv2.CALIB_CB_NORMALIZE_IMAGE
+    )
+    typer.echo(f"🔍 Slow/lenient detection (no FAST_CHECK): corners_found={found_slow}")
+
+    annotated = frame.copy()
+    if found_slow:
+        cv2.drawChessboardCorners(annotated, pattern_size, corners_slow, found_slow)
+        annotated_path = os.path.splitext(output)[0] + "_annotated.png"
+        cv2.imwrite(annotated_path, annotated)
+        typer.echo(f"💾 Saved annotated frame to {annotated_path}")
+    else:
+        typer.echo(
+            f"⚠️  Neither pass found the expected {squares_x - 1}x{squares_y - 1} internal-corner "
+            "grid. Check: is the WHOLE board (with white margin) inside the frame? Any glare on "
+            "the paper? Is it in focus? Is it held roughly flat/parallel to the camera?"
+        )
 
 
 @app.command("generate-pattern")
@@ -353,10 +617,59 @@ def cmd_capture(
     squares_x: int = DEFAULT_SQUARES_X,
     squares_y: int = DEFAULT_SQUARES_Y,
     label: Optional[str] = typer.Option(None, help="Label to save this calibration under."),
+    flip: str = typer.Option("horizontal", help="Flip the raw frame before anything else: none/horizontal/vertical/both."),
 ):
     output_dir = os.path.expanduser(output_dir)
-    label, saved = capture_calibration_images(output_dir, camera_id, num_images, squares_x, squares_y, label)
+    label, saved = capture_calibration_images(output_dir, camera_id, num_images, squares_x, squares_y, label, flip)
     typer.echo(f"Captured {len(saved)} images to {output_dir} for camera '{label}'.")
+
+
+@app.command("record-video")
+def cmd_record_video(
+    output: str = typer.Option("~/.solo/camera_calib_images/calib_video.mp4", help="Output video path."),
+    camera_id: Optional[int] = typer.Option(None, help="OpenCV camera index; auto-detected if omitted."),
+    fps: int = typer.Option(30, help="Recording frame rate."),
+    flip: str = typer.Option("horizontal", help="Flip the raw frame before anything else: none/horizontal/vertical/both."),
+):
+    """Record a video of the checkerboard - no keypress required, just
+    Ctrl-C in the terminal when done. Use with `extract-from-video` or
+    `solve-video` afterward."""
+    path = record_calibration_video(output, camera_id, fps, flip)
+    typer.echo(f"✅ Saved video to {path}")
+
+
+@app.command("extract-from-video")
+def cmd_extract_from_video(
+    video: str = typer.Option(..., help="Path to a recorded calibration video."),
+    output_dir: str = typer.Option("~/.solo/camera_calib_images", help="Where to save extracted frames."),
+    num_images: int = DEFAULT_NUM_IMAGES,
+    squares_x: int = DEFAULT_SQUARES_X,
+    squares_y: int = DEFAULT_SQUARES_Y,
+    label: Optional[str] = typer.Option(None, help="Label to save this calibration under."),
+):
+    label, saved = extract_frames_from_video(video, output_dir, squares_x, squares_y, num_images, label)
+    typer.echo(f"Extracted {len(saved)} usable frames to {output_dir} for camera '{label}'.")
+
+
+@app.command("solve-video")
+def cmd_solve_video(
+    video: str = typer.Option(..., help="Path to a recorded calibration video."),
+    label: str = typer.Option(..., help="Label to save this calibration under."),
+    num_images: int = DEFAULT_NUM_IMAGES,
+    squares_x: int = DEFAULT_SQUARES_X,
+    squares_y: int = DEFAULT_SQUARES_Y,
+    square_size_mm: float = DEFAULT_SQUARE_SIZE_MM,
+):
+    """Extract usable frames from a recorded video + solve, in one go."""
+    output_dir = os.path.expanduser("~/.solo/camera_calib_images")
+    label, saved = extract_frames_from_video(video, output_dir, squares_x, squares_y, num_images, label)
+    if len(saved) < 5:
+        typer.echo(f"❌ Only {len(saved)} usable frames found - need at least 5. Re-record with better framing/lighting.")
+        raise typer.Exit(1)
+    result = solve_camera_intrinsics(saved, squares_x, squares_y, square_size_mm)
+    save_camera_calibration(label, result)
+    _print_quality_report(result)
+    typer.echo(f"✅ Saved calibration for '{label}' to {CALIBRATION_PATH}")
 
 
 @app.command("solve")
@@ -388,10 +701,11 @@ def cmd_run(
     squares_x: int = DEFAULT_SQUARES_X,
     squares_y: int = DEFAULT_SQUARES_Y,
     square_size_mm: float = DEFAULT_SQUARE_SIZE_MM,
+    flip: str = typer.Option("horizontal", help="Flip the raw frame before anything else: none/horizontal/vertical/both."),
 ):
     """Capture + solve in one go."""
     output_dir = os.path.expanduser("~/.solo/camera_calib_images")
-    label, saved = capture_calibration_images(output_dir, camera_id, num_images, squares_x, squares_y, label)
+    label, saved = capture_calibration_images(output_dir, camera_id, num_images, squares_x, squares_y, label, flip)
     if not saved:
         typer.echo("❌ No images captured.")
         raise typer.Exit(1)

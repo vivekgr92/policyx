@@ -3,7 +3,8 @@ Scripted camera-to-robot-base (hand-eye) extrinsics calibration for the SO-101
 follower arm, for the AprilTag object-pose pipeline feeding Isaac Mimic.
 
 Physical setup required before running this:
-  - A tag36h11 AprilTag, ID 2, ~35-40mm, mounted on a NON-MOVING part of the
+  - A tag36h11 AprilTag, ID 3, ~40mm (NOT smaller -- see DEFAULT_TAG_SIZE_M),
+    mounted on a NON-MOVING part of the
     wrist/gripper housing (not the jaws) -- its pose relative to the FK chain's
     `gripper_frame_link` (see `so101_fk.py`) must stay fixed regardless of
     gripper open/close state.
@@ -48,8 +49,13 @@ from rich.prompt import Confirm
 from solo.commands.robots.lerobot.sim_augmentation.so101_fk import compute_gripper_pose
 
 TAG_FAMILY = "tag36h11"
-GRIPPER_TAG_ID = 2
-DEFAULT_TAG_SIZE_M = 0.035  # 35mm -- override via run_hand_eye_calibration(tag_size_m=...)
+GRIPPER_TAG_ID = 3
+DEFAULT_TAG_SIZE_M = 0.040  # 40mm -- a real run at 20mm produced a catastrophic
+# 27-32deg hand-eye residual, traced (after ruling out FK and every plausible
+# matrix-convention bug) to AprilTag rotation-estimation noise at a tag too
+# small/distant for reliable pose accuracy; reverted back to 40mm. Override
+# via run_hand_eye_calibration(tag_size_m=...) if you've verified a smaller
+# tag is still accurate enough for your real setup.
 
 _EXTRINSICS_OUTPUT_PATH = Path.home() / ".solo" / "camera_extrinsics.json"
 _INTRINSICS_INPUT_PATH = Path.home() / ".solo" / "camera_calibration.json"
@@ -62,6 +68,13 @@ _NUM_WAYPOINTS = 18
 _GRIPPER_FIXED_PCT = 50.0  # gripper held constant throughout -- irrelevant to the fixed tag frame, but must not be left undefined
 _MOVE_DURATION_S = 1.5
 _SETTLE_S = 0.4
+
+# Manual-mode stationarity check (see where it's used, in
+# run_hand_eye_calibration_manual): arm joints are in degrees, gripper in
+# 0-100 percent-of-travel (so101_joint_mapping.py) -- a single small
+# threshold works across both since the gripper is held fixed throughout.
+_SETTLE_CHECK_S = 0.3
+_SETTLE_CHECK_MAX_DRIFT = 0.5
 
 
 @dataclass
@@ -273,38 +286,15 @@ def solve_hand_eye(samples: list[HandEyeSample]) -> dict:
     }
 
 
-def run_hand_eye_calibration(
-    camera_angle: str = "front",
-    robot_type: str = "so101",
-    follower_id: Optional[str] = None,
-    follower_port: Optional[str] = None,
-    tag_size_m: float = DEFAULT_TAG_SIZE_M,
-    fps: int = 30,
-) -> dict:
-    """Top-level orchestration: connect, sweep, capture, solve, save. Real
-    hardware motion -- Ctrl-C is handled via the same `safe_shutdown()` path
-    DeployX's edge agent uses (disables torque, disconnects cleanly) rather
-    than leaving the arm powered mid-motion."""
+def _resolve_hand_eye_setup(camera_angle, robot_type, follower_id, follower_port):
+    """Shared by both the autonomous and manual flows: resolve the port/id,
+    set up the camera, and load intrinsics. No hardware motion happens here."""
     import json as _json
     import os as _os
 
-    from lerobot.processor import make_default_robot_action_processor
-    from lerobot.robots import make_robot_from_config
-    from pupil_apriltags import Detector
-
     from solo.commands.robots.lerobot.cameras import setup_cameras
-    from solo.commands.robots.lerobot.config import create_follower_config, get_robot_config_classes
-    from solo.commands.robots.lerobot.deployx.safety import load_joint_limits, safe_shutdown
+    from solo.commands.robots.lerobot.config import get_robot_config_classes
     from solo.commands.robots.lerobot.ports import detect_arm_port
-
-    typer.echo("🎯 SO-101 hand-eye (camera-to-base) extrinsics calibration")
-    typer.echo(
-        f"   Make sure a {TAG_FAMILY} tag, ID {GRIPPER_TAG_ID}, is mounted on a NON-MOVING part "
-        "of the wrist/gripper housing before continuing."
-    )
-    if not Confirm.ask("Tag mounted and ready?", default=True):
-        typer.echo("Aborted.")
-        return {}
 
     _, follower_config_class = get_robot_config_classes(robot_type)
     if follower_port is None:
@@ -337,6 +327,509 @@ def run_hand_eye_calibration(
     camera_angle = camera_config["cameras"][0]["angle"]
 
     camera_matrix, dist_coeffs = _load_camera_intrinsics(camera_angle)
+    return follower_config_class, follower_port, follower_id, camera_config, camera_angle, camera_matrix, dist_coeffs
+
+
+def _resolve_leader_setup(robot_type, leader_id, leader_port):
+    """Resolve the leader arm's port/id the same way `teleoperation.py` does
+    -- reusing the port/id already saved in ~/.solo/config.json from normal
+    `solo robo` teleop setup, rather than asking the user to re-enter it."""
+    import json as _json
+    import os as _os
+
+    from solo.commands.robots.lerobot.config import get_robot_config_classes
+    from solo.commands.robots.lerobot.ports import detect_arm_port
+
+    leader_config_class, _ = get_robot_config_classes(robot_type)
+    if leader_port is None:
+        solo_config_path = _os.path.expanduser("~/.solo/config.json")
+        solo_config = {}
+        if _os.path.isfile(solo_config_path):
+            with open(solo_config_path) as f:
+                solo_config = _json.load(f)
+        leader_port = solo_config.get("lerobot", {}).get("leader_port")
+        if not leader_port:
+            leader_port, _ = detect_arm_port("leader", robot_type=robot_type)
+            if not leader_port:
+                raise RuntimeError("Could not auto-detect the SO-101 leader arm's port.")
+
+    if leader_id is None:
+        solo_config_path = _os.path.expanduser("~/.solo/config.json")
+        solo_config = {}
+        if _os.path.isfile(solo_config_path):
+            with open(solo_config_path) as f:
+                solo_config = _json.load(f)
+        saved_leader_id = solo_config.get("lerobot", {}).get("leader_id")
+        if saved_leader_id:
+            leader_id = saved_leader_id
+        else:
+            from solo.commands.robots.lerobot.utils.helper import prompt_arm_id
+
+            leader_id = prompt_arm_id(solo_config, "leader", robot_type)
+
+    return leader_config_class, leader_port, leader_id
+
+
+_SAMPLES_DUMP_PATH = Path.home() / ".solo" / "camera_extrinsics_debug_samples.json"
+
+
+_SAMPLE_FRAMES_DIR = Path.home() / ".solo" / "camera_extrinsics_debug_frames"
+
+
+def _dump_sample_frame(frame, index: int) -> None:
+    """Saves the real camera frame for a captured sample, so a bad/suspect
+    sample (flagged by analyze_sample_consistency) can be visually inspected
+    afterward -- same technique that found the real root cause of the
+    checkerboard capture issues earlier (numerical reasoning alone wasn't
+    enough; looking at the actual image was)."""
+    import cv2
+
+    _SAMPLE_FRAMES_DIR.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(_SAMPLE_FRAMES_DIR / f"sample_{index:02d}.png"), frame)
+
+
+def _dump_raw_samples(samples: list[HandEyeSample], camera_angle: str) -> None:
+    """Saves the raw gripper2base/target2cam 4x4 matrices from a real run so
+    they can be inspected/re-analyzed afterward without needing to re-run
+    hardware -- added after a real run produced a catastrophic residual
+    (27-32deg / 400-470mm) with FK independently verified exactly correct
+    against lerobot's own authoritative implementation, so the next real
+    run's raw data is what's needed to pin down whether it's AprilTag
+    measurement noise/accuracy or insufficient pose diversity."""
+    data = {
+        "camera_angle": camera_angle,
+        "samples": [
+            {"gripper2base": s.gripper2base.tolist(), "target2cam": s.target2cam.tolist()}
+            for s in samples
+        ],
+    }
+    _SAMPLES_DUMP_PATH.write_text(json.dumps(data, indent=2))
+    typer.echo(f"💾 Raw samples dumped to {_SAMPLES_DUMP_PATH} (for diagnostics, see analyze_sample_consistency())")
+
+
+def analyze_sample_consistency(samples: list[HandEyeSample]) -> None:
+    """
+    Convention-invariant sanity check, independent of solve_hand_eye(): for
+    each consecutive sample pair, compute the ROTATION ANGLE MAGNITUDE of the
+    relative motion two ways -- (a) via FK (gripper2base) and (b) via the
+    AprilTag (target2cam) -- and compare them directly.
+
+    This works without knowing the true cam2base transform or any axis
+    convention, because rotation ANGLE magnitude (not axis) is invariant
+    under a fixed similarity transform: if gripper2base_j @ inv(gripper2base_i)
+    has rotation angle theta, then cam2base @ (that same relative motion,
+    expressed in camera frame) also has rotation angle theta, for ANY fixed
+    cam2base -- so target2cam_j @ inv(target2cam_i) should have close to the
+    SAME rotation angle, regardless of what cam2base actually is.
+
+    If the two angle sequences track closely -> the two measurement sources
+    (FK, AprilTag) are mutually consistent, and a bad solve is more likely a
+    pose-diversity/conditioning issue. If they disagree substantially and
+    inconsistently -> hard evidence of a real problem in one of the two
+    measurement sources (most likely AprilTag pose noise/accuracy, since FK
+    was independently verified exact).
+    """
+    import math as _math
+
+    n = len(samples)
+    if n < 2:
+        typer.echo("Need at least 2 samples to analyze consistency.")
+        return
+
+    typer.echo(f"\n🔬 Relative-rotation consistency check ({n} samples, {n - 1} consecutive pairs):")
+    typer.echo(f"{'pair':>8}  {'FK angle':>10}  {'tag angle':>10}  {'diff':>8}")
+    diffs = []
+    for i in range(n - 1):
+        g_i, g_j = samples[i].gripper2base, samples[i + 1].gripper2base
+        t_i, t_j = samples[i].target2cam, samples[i + 1].target2cam
+
+        R_fk_rel = (g_j[:3, :3] @ np.linalg.inv(g_i[:3, :3]))
+        angle_fk = _math.degrees(_math.acos(np.clip((np.trace(R_fk_rel) - 1) / 2, -1.0, 1.0)))
+
+        R_tag_rel = (t_j[:3, :3] @ np.linalg.inv(t_i[:3, :3]))
+        angle_tag = _math.degrees(_math.acos(np.clip((np.trace(R_tag_rel) - 1) / 2, -1.0, 1.0)))
+
+        diff = abs(angle_fk - angle_tag)
+        diffs.append(diff)
+        flag = "  <-- LARGE DISAGREEMENT" if diff > 10.0 else ""
+        typer.echo(f"{i:>5}->{i + 1:<2}  {angle_fk:9.2f}°  {angle_tag:9.2f}°  {diff:7.2f}°{flag}")
+
+    typer.echo(
+        f"\nMean angle diff: {float(np.mean(diffs)):.2f}°  Max: {float(np.max(diffs)):.2f}°"
+    )
+    if float(np.mean(diffs)) > 10.0:
+        typer.echo(
+            "⚠️  Large, consistent disagreement between FK-measured and AprilTag-measured "
+            "rotation -- since FK is independently verified exact, this points to the AprilTag "
+            "pose estimate itself (check: real tag size vs --tag-size-m, tag flatness/rigidity "
+            "on the mount, viewing angle/distance during capture, motion blur)."
+        )
+    else:
+        typer.echo(
+            "✅ FK and AprilTag measurements are mutually consistent -- a bad solve is more "
+            "likely a pose-diversity/conditioning issue (poses too similar/co-planar) than a "
+            "measurement-source bug."
+        )
+    also_small = sum(1 for a in diffs if a < 10.0)
+    fk_angles = []
+    for i in range(n - 1):
+        g_i, g_j = samples[i].gripper2base, samples[i + 1].gripper2base
+        R_fk_rel = (g_j[:3, :3] @ np.linalg.inv(g_i[:3, :3]))
+        fk_angles.append(_math.degrees(_math.acos(np.clip((np.trace(R_fk_rel) - 1) / 2, -1.0, 1.0))))
+    if max(fk_angles) < 15.0:
+        typer.echo(
+            f"⚠️  Also: max FK-measured rotation between ANY consecutive pair is only "
+            f"{max(fk_angles):.1f}° -- the captured poses may simply be too similar/clustered "
+            "for a well-conditioned hand-eye solve, independent of measurement accuracy."
+        )
+
+
+def _all_pairs_sample_scores(samples: list[HandEyeSample]) -> list[float]:
+    """Per-sample badness score: mean FK-vs-tag rotation-angle disagreement
+    across EVERY other sample (not just its consecutive neighbor). Consecutive-
+    only comparison (analyze_sample_consistency) can miss a bad sample whose
+    neighbors happen to be fine but whose relationship to FAR samples is
+    inconsistent -- a real run showed exactly this: one sample appeared in 6
+    of the 10 worst (i,j) pairs across the full all-pairs comparison despite
+    looking unremarkable against just its immediate neighbors."""
+    import math as _math
+
+    n = len(samples)
+    per_sample = [[] for _ in range(n)]
+    for i in range(n):
+        for j in range(i + 1, n):
+            g_i, g_j = samples[i].gripper2base, samples[j].gripper2base
+            t_i, t_j = samples[i].target2cam, samples[j].target2cam
+            R_fk = g_j[:3, :3] @ np.linalg.inv(g_i[:3, :3])
+            angle_fk = _math.degrees(_math.acos(np.clip((np.trace(R_fk) - 1) / 2, -1.0, 1.0)))
+            R_tag = t_j[:3, :3] @ np.linalg.inv(t_i[:3, :3])
+            angle_tag = _math.degrees(_math.acos(np.clip((np.trace(R_tag) - 1) / 2, -1.0, 1.0)))
+            diff = abs(angle_fk - angle_tag)
+            per_sample[i].append(diff)
+            per_sample[j].append(diff)
+    return [float(np.mean(d)) for d in per_sample]
+
+
+def filter_outlier_samples(samples: list[HandEyeSample], min_samples: int = 8) -> list[HandEyeSample]:
+    """Greedily drops the single worst-scoring sample (by all-pairs disagreement,
+    see _all_pairs_sample_scores), re-solves, and keeps the removal only if the
+    mean rotation residual actually improved -- repeats until it stops helping
+    or min_samples is reached. Reports what it removed and why, so this is a
+    visible, auditable step, not a silent data-massaging trick."""
+    current = list(samples)
+    best_result = solve_hand_eye(current)
+    best_rot = best_result["mean_rotation_residual_deg"]
+    typer.echo(f"\n🧹 Outlier filtering: starting residual {best_rot:.2f}° with {len(current)} samples")
+
+    while len(current) > min_samples:
+        scores = _all_pairs_sample_scores(current)
+        worst_idx = int(np.argmax(scores))
+        candidate = [s for i, s in enumerate(current) if i != worst_idx]
+        try:
+            candidate_result = solve_hand_eye(candidate)
+        except ValueError:
+            break
+        candidate_rot = candidate_result["mean_rotation_residual_deg"]
+        if candidate_rot < best_rot:
+            typer.echo(
+                f"   dropping sample (score {scores[worst_idx]:.1f}°) -> "
+                f"residual {best_rot:.2f}° to {candidate_rot:.2f}° ({len(candidate)} left)"
+            )
+            current = candidate
+            best_rot = candidate_rot
+        else:
+            typer.echo(
+                f"   worst remaining sample (score {scores[worst_idx]:.1f}°) wouldn't improve the "
+                f"solve ({candidate_rot:.2f}° vs current {best_rot:.2f}°) -- stopping here"
+            )
+            break
+
+    if len(current) < len(samples):
+        typer.echo(f"🧹 Kept {len(current)}/{len(samples)} samples, final residual {best_rot:.2f}°")
+    else:
+        typer.echo("🧹 No sample removal improved the solve -- keeping all samples")
+    return current
+
+
+def _save_hand_eye_result(samples: list[HandEyeSample], camera_angle: str, tag_size_m: float) -> dict:
+    _dump_raw_samples(samples, camera_angle)
+    analyze_sample_consistency(samples)
+    samples = filter_outlier_samples(samples)
+    typer.echo(f"\n📐 Solving with {len(samples)} usable samples...")
+    result = solve_hand_eye(samples)
+    result["camera_angle"] = camera_angle
+    result["tag_size_m"] = tag_size_m
+
+    _EXTRINSICS_OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    existing = {}
+    if _EXTRINSICS_OUTPUT_PATH.is_file():
+        with open(_EXTRINSICS_OUTPUT_PATH) as f:
+            existing = json.load(f)
+    existing[camera_angle] = result
+    with open(_EXTRINSICS_OUTPUT_PATH, "w") as f:
+        json.dump(existing, f, indent=2)
+
+    typer.echo(f"\n✅ Saved camera-to-base extrinsics for '{camera_angle}' to {_EXTRINSICS_OUTPUT_PATH}")
+    typer.echo(
+        f"   Residual: mean {result['mean_rotation_residual_deg']:.2f}deg / "
+        f"{result['mean_translation_residual_m'] * 1000:.1f}mm, "
+        f"max {result['max_rotation_residual_deg']:.2f}deg / {result['max_translation_residual_m'] * 1000:.1f}mm "
+        "(lower is better; several degrees / cm indicates a poor solve -- re-run with more/better-spread poses)"
+    )
+    return result
+
+
+def run_hand_eye_calibration_manual(
+    camera_angle: str = "front",
+    robot_type: str = "so101",
+    follower_id: Optional[str] = None,
+    follower_port: Optional[str] = None,
+    tag_size_m: float = DEFAULT_TAG_SIZE_M,
+    num_samples: int = _NUM_WAYPOINTS,
+    min_samples: int = 8,
+    use_leader: bool = False,
+    leader_id: Optional[str] = None,
+    leader_port: Optional[str] = None,
+) -> dict:
+    """Manual: the script never scripts a move on its own. Two ways to pose
+    the arm between captures:
+      - use_leader=False (default): torque is disabled right after connecting
+        (same mechanism `safe_shutdown()` uses as the hardware's safe-stop,
+        just applied at the START instead of the end) so the follower is
+        freely back-drivable BY HAND.
+      - use_leader=True: torque stays ON, and this runs a real (but minimal)
+        teleop mirror loop -- same per-step pattern as lerobot's own
+        `teleop_loop()` (read leader action, process, send to follower) --
+        so you drive the follower by moving the LEADER arm, reusing the
+        leader port/id already saved from normal `solo robo` teleop setup.
+    Either way: pose the arm, watch the preview window for a green 'tag
+    detected' status, press Enter in THIS TERMINAL to capture (or type
+    'done' once you have >= min_samples to solve early)."""
+    import json as _json
+    import queue
+    import threading
+
+    import cv2
+    from lerobot.robots import make_robot_from_config
+    from pupil_apriltags import Detector
+
+    from solo.commands.robots.lerobot.config import create_follower_config, create_leader_config
+    from solo.commands.robots.lerobot.deployx.safety import safe_shutdown
+
+    typer.echo("🎯 SO-101 hand-eye (camera-to-base) extrinsics calibration -- MANUAL mode")
+    typer.echo(
+        f"   Make sure a {TAG_FAMILY} tag, ID {GRIPPER_TAG_ID}, is mounted on a NON-MOVING part "
+        "of the wrist/gripper housing before continuing. The arm will NOT move on a script -- "
+        + ("you drive the follower by moving the LEADER arm." if use_leader else "you pose it by hand.")
+    )
+    if not Confirm.ask("Tag mounted and ready?", default=True):
+        typer.echo("Aborted.")
+        return {}
+
+    (follower_config_class, follower_port, follower_id, camera_config,
+     camera_angle, camera_matrix, dist_coeffs) = _resolve_hand_eye_setup(
+        camera_angle, robot_type, follower_id, follower_port
+    )
+
+    follower_config = create_follower_config(
+        follower_config_class, follower_port, robot_type, camera_config=camera_config, follower_id=follower_id
+    )
+    detector = Detector(families=TAG_FAMILY)
+
+    teleop = None
+    teleop_action_processor = robot_action_processor_pipeline = None
+    if use_leader:
+        from lerobot.processor import make_default_processors
+        from lerobot.teleoperators import make_teleoperator_from_config
+
+        leader_config_class, leader_port, leader_id = _resolve_leader_setup(robot_type, leader_id, leader_port)
+        leader_config = create_leader_config(
+            leader_config_class, leader_port, robot_type, leader_id=leader_id, follower_id=follower_id
+        )
+        teleop = make_teleoperator_from_config(leader_config)
+        teleop_action_processor, robot_action_processor_pipeline, _ = make_default_processors()
+
+    robot = None
+    samples: list[HandEyeSample] = []
+    try:
+        robot = make_robot_from_config(follower_config)
+        robot.connect()
+
+        if use_leader:
+            teleop.connect()
+            typer.echo(f"🎮 Leader connected ({leader_port}) -- move it to drive the follower.")
+        else:
+            bus = getattr(robot, "bus", None)
+            if bus is not None and hasattr(bus, "disable_torque"):
+                bus.disable_torque()
+                typer.echo("🔓 Torque disabled -- the arm is free to move by hand.")
+            else:
+                typer.echo(
+                    "⚠️  Could not find a way to disable torque on this robot object -- the arm may "
+                    "still be powered/holding position. Move it carefully, or use --use-leader."
+                )
+
+        typer.echo(
+            f"\nTarget: {num_samples} samples (will solve early with 'done' once you have "
+            f">= {min_samples}). For each: pose the arm, watch the preview window for a green "
+            "'tag detected' status, then press ENTER in THIS TERMINAL to capture (or type 'done').\n"
+        )
+
+        # input() blocks, but macOS requires cv2's GUI window to be pumped
+        # from the main thread -- so terminal input runs in a background
+        # thread (just blocking stdin I/O, no GUI/hardware calls) and feeds
+        # a queue the main thread polls non-blockingly, while the main
+        # thread owns the live camera loop AND all robot.get_observation()
+        # calls (no concurrent access to the robot object from two threads).
+        input_queue: "queue.Queue[str]" = queue.Queue()
+
+        def _input_worker():
+            while True:
+                try:
+                    line = input()
+                except EOFError:
+                    input_queue.put("done")
+                    return
+                input_queue.put(line)
+
+        threading.Thread(target=_input_worker, daemon=True).start()
+
+        latest_joint_positions: Optional[dict] = None
+        latest_frame = None
+        window = "Hand-eye calibration (manual) - pose arm, then ENTER in terminal"
+
+        while len(samples) < num_samples:
+            obs = robot.get_observation()
+
+            if use_leader:
+                # Same per-step pattern as lerobot's own teleop_loop(): read
+                # the leader's action, process it, send it to the follower --
+                # continuous mirroring, exactly like normal teleop.
+                raw_action = teleop.get_action()
+                teleop_action = teleop_action_processor((raw_action, obs))
+                robot_action_to_send = robot_action_processor_pipeline((teleop_action, obs))
+                robot.send_action(robot_action_to_send)
+                obs = robot.get_observation()  # re-read post-move for an up-to-date sample
+
+            latest_joint_positions = {k[: -len(".pos")]: float(v) for k, v in obs.items() if k.endswith(".pos")}
+            latest_frame = obs.get(camera_angle)
+
+            if latest_frame is not None:
+                tag_found = _detect_gripper_tag(latest_frame, detector, camera_matrix, dist_coeffs, tag_size_m) is not None
+                display = latest_frame.copy()
+                status = f"Samples: {len(samples)}/{num_samples}  tag_found={tag_found}  (ENTER in terminal to capture)"
+                color = (0, 255, 0) if tag_found else (0, 0, 255)
+                cv2.putText(display, status, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                cv2.imshow(window, display)
+            cv2.waitKey(1)  # pumps the GUI event loop so the window actually renders/updates
+
+            try:
+                raw = input_queue.get_nowait()
+            except queue.Empty:
+                continue
+
+            if raw.strip().lower() == "done":
+                if len(samples) < min_samples:
+                    typer.echo(f"   Need at least {min_samples} samples, only have {len(samples)} -- keep going.")
+                    continue
+                break
+
+            if latest_frame is None:
+                typer.echo("   ⚠️  no camera frame captured, try again")
+                continue
+
+            # Settle check: a sample is only valid if the joint encoders agree
+            # across two reads taken _SETTLE_CHECK_S apart. Without this, a
+            # sample taken while the arm is still catching up to a commanded
+            # pose (servo lag, or you pressed Enter mid-motion) pairs a joint
+            # reading with a camera frame of a DIFFERENT real pose -- exactly
+            # the kind of mismatch that produces a garbage hand-eye solve
+            # (confirmed: a real run without this check gave a ~27deg/40cm
+            # mean residual, nonsense given the solver math itself was
+            # already verified correct on synthetic data).
+            time.sleep(_SETTLE_CHECK_S)
+            obs2 = robot.get_observation()
+            recheck_positions = {k[: -len(".pos")]: float(v) for k, v in obs2.items() if k.endswith(".pos")}
+            max_drift = max(
+                abs(recheck_positions.get(name, v) - v) for name, v in latest_joint_positions.items()
+            )
+            if max_drift > _SETTLE_CHECK_MAX_DRIFT:
+                typer.echo(f"   ⚠️  still moving (drift {max_drift:.2f}) -- hold still and press ENTER again")
+                continue
+            latest_joint_positions = recheck_positions
+            latest_frame = obs2.get(camera_angle, latest_frame)
+
+            tag_pose_cam = _detect_gripper_tag(latest_frame, detector, camera_matrix, dist_coeffs, tag_size_m)
+            if tag_pose_cam is None:
+                typer.echo("   ⚠️  tag not detected in this pose -- reposition and try again")
+                continue
+
+            gripper_pose_base = compute_gripper_pose(latest_joint_positions)
+            samples.append(HandEyeSample(gripper2base=gripper_pose_base, target2cam=tag_pose_cam))
+            _dump_sample_frame(latest_frame, len(samples) - 1)
+            typer.echo(f"   ✅ captured ({len(samples)}/{num_samples})")
+
+    except KeyboardInterrupt:
+        typer.echo("\n🛑 Interrupted by user.")
+    finally:
+        cv2.destroyAllWindows()
+        if teleop is not None:
+            try:
+                if getattr(teleop, "is_connected", False):
+                    teleop.disconnect()
+            except Exception as e:
+                typer.echo(f"⚠️  Error disconnecting leader: {e}")
+        safe_shutdown(robot, reason="manual hand-eye calibration finished or interrupted")
+
+    if len(samples) < min_samples:
+        typer.echo(f"❌ Only {len(samples)} samples -- need at least {min_samples}. Re-run to collect more.")
+        return {}
+
+    return _save_hand_eye_result(samples, camera_angle, tag_size_m)
+
+
+def run_hand_eye_calibration(
+    camera_angle: str = "front",
+    robot_type: str = "so101",
+    follower_id: Optional[str] = None,
+    follower_port: Optional[str] = None,
+    tag_size_m: float = DEFAULT_TAG_SIZE_M,
+    fps: int = 30,
+) -> dict:
+    """Autonomous version: scripts the arm through `_NUM_WAYPOINTS` real
+    moves on its own. NOT the default entrypoint anymore -- a real run
+    produced unexpected/alarming motion, so `run_hand_eye_calibration_manual`
+    (no scripted motion at all, you pose the arm by hand) is the default when
+    this module is run directly. Kept here for later, once the autonomous
+    path's behavior is understood and fixed. Ctrl-C is handled via the same
+    `safe_shutdown()` path DeployX's edge agent uses (disables torque,
+    disconnects cleanly) rather than leaving the arm powered mid-motion."""
+    import json as _json
+    import os as _os
+
+    from lerobot.processor import make_default_robot_action_processor
+    from lerobot.robots import make_robot_from_config
+    from pupil_apriltags import Detector
+
+    from solo.commands.robots.lerobot.cameras import setup_cameras
+    from solo.commands.robots.lerobot.config import create_follower_config, get_robot_config_classes
+    from solo.commands.robots.lerobot.deployx.safety import load_joint_limits, safe_shutdown
+    from solo.commands.robots.lerobot.ports import detect_arm_port
+
+    typer.echo("🎯 SO-101 hand-eye (camera-to-base) extrinsics calibration")
+    typer.echo(
+        f"   Make sure a {TAG_FAMILY} tag, ID {GRIPPER_TAG_ID}, is mounted on a NON-MOVING part "
+        "of the wrist/gripper housing before continuing."
+    )
+    if not Confirm.ask("Tag mounted and ready?", default=True):
+        typer.echo("Aborted.")
+        return {}
+
+    (follower_config_class, follower_port, follower_id, camera_config,
+     camera_angle, camera_matrix, dist_coeffs) = _resolve_hand_eye_setup(
+        camera_angle, robot_type, follower_id, follower_port
+    )
+
     limits = load_joint_limits(robot_type, follower_id)
     waypoints = _generate_waypoints(limits)
 
@@ -380,29 +873,19 @@ def run_hand_eye_calibration(
     finally:
         safe_shutdown(robot, reason="hand-eye calibration finished or interrupted")
 
-    typer.echo(f"\n📐 Solving with {len(samples)}/{len(waypoints)} usable samples...")
-    result = solve_hand_eye(samples)
-    result["camera_angle"] = camera_angle
-    result["tag_size_m"] = tag_size_m
+    return _save_hand_eye_result(samples, camera_angle, tag_size_m)
 
-    _EXTRINSICS_OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    existing = {}
-    if _EXTRINSICS_OUTPUT_PATH.is_file():
-        with open(_EXTRINSICS_OUTPUT_PATH) as f:
-            existing = json.load(f)
-    existing[camera_angle] = result
-    with open(_EXTRINSICS_OUTPUT_PATH, "w") as f:
-        json.dump(existing, f, indent=2)
 
-    typer.echo(f"\n✅ Saved camera-to-base extrinsics for '{camera_angle}' to {_EXTRINSICS_OUTPUT_PATH}")
-    typer.echo(
-        f"   Residual: mean {result['mean_rotation_residual_deg']:.2f}deg / "
-        f"{result['mean_translation_residual_m'] * 1000:.1f}mm, "
-        f"max {result['max_rotation_residual_deg']:.2f}deg / {result['max_translation_residual_m'] * 1000:.1f}mm "
-        "(lower is better; several degrees / cm indicates a poor solve -- re-run with more/better-spread waypoints)"
+def _cli(
+    use_leader: bool = typer.Option(False, "--use-leader", help="Drive the follower via the leader arm (teleop) instead of hand-posing it."),
+    num_samples: int = typer.Option(_NUM_WAYPOINTS, help="Target number of samples."),
+    min_samples: int = typer.Option(8, help="Minimum samples needed to solve."),
+    tag_size_m: float = typer.Option(DEFAULT_TAG_SIZE_M, help="Gripper tag physical size, in meters."),
+):
+    run_hand_eye_calibration_manual(
+        use_leader=use_leader, num_samples=num_samples, min_samples=min_samples, tag_size_m=tag_size_m
     )
-    return result
 
 
 if __name__ == "__main__":
-    run_hand_eye_calibration()
+    typer.run(_cli)

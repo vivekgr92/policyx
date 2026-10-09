@@ -128,13 +128,16 @@ class CupPickPlaceTerminationsCfg:
     testing) -- it reads and then clears it before running DataGenerator,
     since success there is evaluated out-of-band per generated trial, not
     as a live env termination. Reuses cup_grasped (same validated heuristic
-    as the subtask-progress observations above) on the last cup in the
-    sequence as a simple proxy for "task done" -- not a rigorous placement
-    check, just enough for DataGenerator.generate() to run end-to-end.
+    as the subtask-progress observations above) on cup_b -- matching the
+    single-subtask simplification above, this must stay in sync with
+    subtask_configs' object_ref -- as a simple proxy for "task done", not a
+    rigorous placement check. (Confirmed via a real run: this was pointed at
+    cup_c while the subtask targeted cup_b, so 0% of trials ever registered
+    as successful even though they ran without crashing.)
     """
 
     time_out = DoneTerm(func=time_out, time_out=True)
-    success = DoneTerm(func=cup_grasped, time_out=False, params={"cup_name": "cup_c"})
+    success = DoneTerm(func=cup_grasped, time_out=False, params={"cup_name": "cup_b"})
 
 
 @configclass

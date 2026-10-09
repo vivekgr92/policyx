@@ -16,7 +16,17 @@ def cup_grasped(
     cup_name: str,
     ee_frame_cfg: SceneEntityCfg = SceneEntityCfg("ee_frame"),
     gripper_joint_name: str = "Jaw",
-    gripper_closed_threshold: float = 0.0,
+    # Real root cause, found via a live Mimic trial + direct inspection of
+    # our own exported HDF5 (not guessed): so101_joint_mapping.py's
+    # to_sim_radians() maps the Jaw's real nominal_limit_rad=(-0.174533,
+    # 1.74533) with GRIPPER_PCT_MAPS_TO_LOWER_AT_ZERO=True, so this
+    # dataset's recorded "closed" range (24-32%, confirmed below the
+    # exporter's own 30% grasp_threshold_pct) maps to +0.29..+0.44 rad --
+    # POSITIVE, never negative. The old default of 0.0 could only ever be
+    # satisfied below ~9% recorded gripper value, which this real dataset
+    # never reaches -- so is_closed was permanently False all session.
+    # 0.40 ~= to_sim_radians(30.0), matching the exporter's own threshold.
+    gripper_closed_threshold: float = 0.40,
     proximity_threshold: float = 0.06,
     robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:

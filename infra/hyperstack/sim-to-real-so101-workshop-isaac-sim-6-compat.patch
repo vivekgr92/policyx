@@ -32,7 +32,7 @@ index 91e9d3e..d5acc74 100644
          robot_root_pos, robot_root_quat, ee_frame_pos, ee_frame_quat
      )
 diff --git a/source/sim_to_real_so101/mdp/resets.py b/source/sim_to_real_so101/mdp/resets.py
-index 8257944..9e0cbf7 100644
+index 8257944..65730bd 100644
 --- a/source/sim_to_real_so101/mdp/resets.py
 +++ b/source/sim_to_real_so101/mdp/resets.py
 @@ -25,7 +25,7 @@ import isaaclab.utils.math as math_utils
@@ -44,7 +44,7 @@ index 8257944..9e0cbf7 100644
  
  
  
-@@ -79,7 +79,7 @@ def randomize_mat_rotation(
+@@ -79,10 +79,10 @@ def randomize_mat_rotation(
      
      orientations = math_utils.quat_from_euler_xyz(roll, pitch, base_yaw + yaw)
      
@@ -52,8 +52,12 @@ index 8257944..9e0cbf7 100644
 +    asset_xform = XformPrim(asset_prim_path)
      
      with Sdf.ChangeBlock():
-         asset_xform.set_local_poses(orientations=orientations)
-@@ -268,7 +268,7 @@ def randomize_sky_light(
+-        asset_xform.set_local_poses(orientations=orientations)
++        asset_xform.set_local_poses(orientations=orientations.cpu().numpy())
+ 
+ 
+ def randomize_camera_focal_length(
+@@ -268,10 +268,10 @@ def randomize_sky_light(
          rand_samples[:, 0], rand_samples[:, 1], rand_samples[:, 2]
      )
  
@@ -61,7 +65,11 @@ index 8257944..9e0cbf7 100644
 +    asset_xform = XformPrim(asset_prim_path)
  
      with Sdf.ChangeBlock():
-         asset_xform.set_local_poses(orientations=orientations)
+-        asset_xform.set_local_poses(orientations=orientations)
++        asset_xform.set_local_poses(orientations=orientations.cpu().numpy())
+         prim = stage.GetPrimAtPath(asset_prim_path)
+         if prim.IsValid():
+             prim.GetAttribute("inputs:exposure").Set(exposure)
 @@ -331,7 +331,7 @@ def reset_vials_rack(
      ]
  

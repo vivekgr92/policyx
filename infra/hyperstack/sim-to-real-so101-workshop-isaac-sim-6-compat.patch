@@ -1,0 +1,91 @@
+diff --git a/source/sim_to_real_so101/assets/so101.py b/source/sim_to_real_so101/assets/so101.py
+index 6077709..99e546b 100644
+--- a/source/sim_to_real_so101/assets/so101.py
++++ b/source/sim_to_real_so101/assets/so101.py
+@@ -19,7 +19,11 @@ import numpy as np
+ import isaaclab.sim as sim_utils
+ from isaaclab.actuators import ImplicitActuatorCfg
+ from isaaclab.assets.articulation import ArticulationCfg
+-from isaacsim.core.utils.rotations import euler_angles_to_quat
++from isaacsim.core.experimental.utils.transform import euler_angles_to_quaternion
++
++
++def euler_angles_to_quat(euler_angles, degrees=False):
++    return euler_angles_to_quaternion(euler_angles, degrees=degrees).numpy()
+ 
+ here = os.path.dirname(os.path.abspath(__file__))
+ 
+diff --git a/source/sim_to_real_so101/mdp/resets.py b/source/sim_to_real_so101/mdp/resets.py
+index 8257944..9e0cbf7 100644
+--- a/source/sim_to_real_so101/mdp/resets.py
++++ b/source/sim_to_real_so101/mdp/resets.py
+@@ -25,7 +25,7 @@ import isaaclab.utils.math as math_utils
+ from isaaclab.sim import get_current_stage
+ from isaaclab.managers import SceneEntityCfg
+ from isaaclab.assets import Articulation, RigidObject
+-from isaacsim.core.prims import XFormPrim
++from isaacsim.core.experimental.prims import XformPrim
+ 
+ 
+ 
+@@ -79,7 +79,7 @@ def randomize_mat_rotation(
+     
+     orientations = math_utils.quat_from_euler_xyz(roll, pitch, base_yaw + yaw)
+     
+-    asset_xform = XFormPrim(prim_paths_expr=asset_prim_path)
++    asset_xform = XformPrim(asset_prim_path)
+     
+     with Sdf.ChangeBlock():
+         asset_xform.set_local_poses(orientations=orientations)
+@@ -268,7 +268,7 @@ def randomize_sky_light(
+         rand_samples[:, 0], rand_samples[:, 1], rand_samples[:, 2]
+     )
+ 
+-    asset_xform = XFormPrim(prim_paths_expr=asset_prim_path)
++    asset_xform = XformPrim(asset_prim_path)
+ 
+     with Sdf.ChangeBlock():
+         asset_xform.set_local_poses(orientations=orientations)
+@@ -331,7 +331,7 @@ def reset_vials_rack(
+     ]
+ 
+     rack = env.scene[rack]
+-    slots_xform_view = XFormPrim(prim_paths_expr=f"{rack.cfg.prim_path}/Body1/Mesh/top_*")
++    slots_xform_view = XformPrim(f"{rack.cfg.prim_path}/Body1/Mesh/top_*")
+     total_slots = len(slots_xform_view.prims)
+ 
+     # randomize rack pose
+diff --git a/source/sim_to_real_so101/tasks/task_env_cfg.py b/source/sim_to_real_so101/tasks/task_env_cfg.py
+index 2f27635..148457f 100644
+--- a/source/sim_to_real_so101/tasks/task_env_cfg.py
++++ b/source/sim_to_real_so101/tasks/task_env_cfg.py
+@@ -22,7 +22,11 @@ from isaaclab.utils import configclass
+ from isaaclab.assets import AssetBaseCfg
+ from isaaclab.utils import configclass
+ from isaaclab.sensors import TiledCameraCfg
+-from isaacsim.core.utils.rotations import euler_angles_to_quat
++from isaacsim.core.experimental.utils.transform import euler_angles_to_quaternion
++
++
++def euler_angles_to_quat(euler_angles, degrees=False):
++    return euler_angles_to_quaternion(euler_angles, degrees=degrees).numpy()
+ from isaaclab.managers import ObservationGroupCfg as ObsGroup
+ from isaaclab.managers import ObservationTermCfg as ObsTerm
+ 
+diff --git a/source/sim_to_real_so101/tasks/vials_to_rack_env_cfg.py b/source/sim_to_real_so101/tasks/vials_to_rack_env_cfg.py
+index 861e75f..7b0e77f 100644
+--- a/source/sim_to_real_so101/tasks/vials_to_rack_env_cfg.py
++++ b/source/sim_to_real_so101/tasks/vials_to_rack_env_cfg.py
+@@ -23,7 +23,11 @@ from isaaclab.utils import configclass
+ from isaaclab.assets import RigidObjectCfg, ArticulationCfg, AssetBaseCfg
+ from isaaclab.utils import configclass
+ from isaaclab.sensors import ContactSensorCfg
+-from isaacsim.core.utils.rotations import euler_angles_to_quat
++from isaacsim.core.experimental.utils.transform import euler_angles_to_quaternion
++
++
++def euler_angles_to_quat(euler_angles, degrees=False):
++    return euler_angles_to_quaternion(euler_angles, degrees=degrees).numpy()
+ from isaaclab.managers import ObservationGroupCfg as ObsGroup
+ from isaaclab.managers import ObservationTermCfg as ObsTerm
+ from isaaclab.managers import TerminationTermCfg as DoneTerm

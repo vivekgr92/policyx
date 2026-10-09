@@ -20,6 +20,7 @@ from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import SceneEntityCfg
+from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.utils import configclass
 from isaacsim.core.experimental.utils.transform import euler_angles_to_quaternion
 
@@ -36,7 +37,7 @@ def euler_angles_to_quat(euler_angles, degrees=False):
     return euler_angles_to_quaternion(euler_angles, degrees=degrees).numpy()
 
 from sim_to_real_so101 import assets
-from sim_to_real_so101.mdp import reset_joints_by_offset, JointPositionActionCfg
+from sim_to_real_so101.mdp import reset_joints_by_offset, JointPositionActionCfg, time_out
 from sim_to_real_so101.mdp.cup_mdp import cup_grasped
 from .task_env_cfg import SO101TaskSceneCfg, SO101TaskEnvCfg, TaskEventCfg, TaskObservationsCfg
 
@@ -119,9 +120,28 @@ class CupPickPlaceObservationsCfg(TaskObservationsCfg):
 
 
 @configclass
+class CupPickPlaceTerminationsCfg:
+    """Termination terms for the cup pick-place task.
+
+    isaaclab_mimic's setup_env_config() requires env_cfg.terminations.success
+    to exist (raises NotImplementedError otherwise, confirmed via live
+    testing) -- it reads and then clears it before running DataGenerator,
+    since success there is evaluated out-of-band per generated trial, not
+    as a live env termination. Reuses cup_grasped (same validated heuristic
+    as the subtask-progress observations above) on the last cup in the
+    sequence as a simple proxy for "task done" -- not a rigorous placement
+    check, just enough for DataGenerator.generate() to run end-to-end.
+    """
+
+    time_out = DoneTerm(func=time_out, time_out=True)
+    success = DoneTerm(func=cup_grasped, time_out=False, params={"cup_name": "cup_c"})
+
+
+@configclass
 class SO101CupPickPlaceEnvCfg(SO101TaskEnvCfg):
     scene: SO101CupPickPlaceSceneCfg = SO101CupPickPlaceSceneCfg()
     observations: CupPickPlaceObservationsCfg = CupPickPlaceObservationsCfg()
+    terminations: CupPickPlaceTerminationsCfg = CupPickPlaceTerminationsCfg()
     actions: CupPickPlaceActionsCfg = CupPickPlaceActionsCfg()
     events: CupPickPlaceEventCfg = CupPickPlaceEventCfg()
 
@@ -150,25 +170,33 @@ class SO101CupPickPlaceMimicEnvCfg(SO101CupPickPlaceEnvCfg, MimicEnvCfg):
         self.datagen_config.max_num_failures = 25
         self.datagen_config.seed = 1
 
-        subtask_configs = []
-        for i, cup_name in enumerate(["cup_a", "cup_b", "cup_c"]):
-            is_last = i == 2
-            subtask_configs.append(
-                SubTaskConfig(
-                    object_ref=cup_name,
-                    subtask_term_signal=None if is_last else f"grasp_{i + 1}",
-                    subtask_term_offset_range=(0, 0) if is_last else (10, 20),
-                    selection_strategy="nearest_neighbor_object",
-                    selection_strategy_kwargs={"nn_k": 3},
-                    action_noise=0.03,
-                    num_interpolation_steps=5,
-                    num_fixed_steps=0,
-                    apply_noise_during_interpolation=False,
-                    description=f"Grasp and place {cup_name}",
-                    next_subtask_description=None if is_last else "Grasp and place next cup",
-                )
+        # TEMPORARY SIMPLIFICATION, confirmed necessary via a live
+        # KeyError('grasp_1') crash in isaaclab_mimic's datagen_info_pool:
+        # mimic_hdf5_export.py's _compute_grasped_signal() currently
+        # collapses a real multi-cup episode into ONE combined
+        # subtask_term_signals["grasped"] boundary + one majority-voted
+        # active_object (per episode 0's real data: "cup_b") -- it does not
+        # yet emit the per-cup-transition grasp_1/grasp_2 signals a genuine
+        # 3-subtask sequence (cup_a -> cup_b -> cup_c) would need. Modeling
+        # a single subtask here matches what the exporter actually produces
+        # today. Real follow-up: extend _compute_grasped_signal to expose
+        # per-segment boundaries with grasp_N-style keys, then restore the
+        # 3-subtask loop this replaced (git log has the original version).
+        self.subtask_configs["robot"] = [
+            SubTaskConfig(
+                object_ref="cup_b",
+                subtask_term_signal=None,
+                subtask_term_offset_range=(0, 0),
+                selection_strategy="nearest_neighbor_object",
+                selection_strategy_kwargs={"nn_k": 3},
+                action_noise=0.03,
+                num_interpolation_steps=5,
+                num_fixed_steps=0,
+                apply_noise_during_interpolation=False,
+                description="Grasp and place cup_b",
+                next_subtask_description=None,
             )
-        self.subtask_configs["robot"] = subtask_configs
+        ]
 
         # Real crash fix: this Kit build does not recognize the
         # /rtx/translucency/reflectAtAllBounce carb setting that

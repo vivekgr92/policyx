@@ -44,6 +44,17 @@ else
   git clone --depth 1 https://github.com/isaac-sim/Sim-to-Real-SO-101-Workshop "${REPO_DIR}"
 fi
 
+# The robot/scene USD assets are Git LFS objects. A plain clone only fetches
+# their tiny text pointer files (~130 bytes) - Isaac Sim will spawn those as
+# the robot without erroring, then fail much later and confusingly with
+# "Expected exactly one ArticulationRootAPI prim ... found 0" once it
+# actually tries to initialize physics on the (effectively empty) asset.
+# Confirmed live: this is not an Isaac Sim 6 API drift issue, just missing
+# LFS content.
+command -v git-lfs >/dev/null || (apt-get update -qq && apt-get install -y -qq git-lfs)
+git -C "${REPO_DIR}" lfs install
+git -C "${REPO_DIR}" lfs pull
+
 echo "==> Applying Isaac Sim 6.0.1 compat patch..."
 git -C "${REPO_DIR}" apply "${SCRIPT_DIR}/sim-to-real-so101-workshop-isaac-sim-6-compat.patch"
 

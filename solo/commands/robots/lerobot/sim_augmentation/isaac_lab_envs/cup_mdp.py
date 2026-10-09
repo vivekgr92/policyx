@@ -32,8 +32,14 @@ def cup_grasped(
     jaw_pos = robot.data.joint_pos[:, jaw_idx]
     is_closed = jaw_pos < gripper_closed_threshold
 
+    # .torch: cup.data.root_pos_w returns a Warp ProxyArray (confirmed via
+    # live isaaclab 3.0.0-beta2 testing), while ee_frame.data.target_pos_w
+    # and robot.data.joint_pos are plain Tensors -- same class of bug fixed
+    # in obs.py earlier, missed here. Didn't corrupt the numbers in practice
+    # (torch.linalg.norm tolerated the mixed types), but fixing for
+    # correctness/forward-compat.
     ee_pos_w = ee_frame.data.target_pos_w[:, 0, :]
-    cup_pos_w = cup.data.root_pos_w
+    cup_pos_w = cup.data.root_pos_w.torch
     dist = torch.linalg.norm(ee_pos_w - cup_pos_w, dim=-1)
     is_near = dist < proximity_threshold
 

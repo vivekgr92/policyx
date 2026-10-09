@@ -65,7 +65,12 @@ class SO101CupPickPlaceSceneCfg(SO101TaskSceneCfg):
 
     cup_b = _cup_base.replace()
     cup_b.prim_path = "{ENV_REGEX_NS}/Cup_B"
-    cup_b.init_state.pos = (0.22, 0.0, CUP_SPAWN_Z)
+    # Matched to the real AprilTag-measured cup_b position from the actual
+    # test source episode (vivekgr92/tags ep 0, mean obs/datagen_info/
+    # object_pose/cup_b), not the original placeholder (0.22, 0.0, Z) --
+    # confirmed via live testing that the ~5.6cm gap between the two was
+    # sitting right at the edge of cup_grasped's 0.06m proximity threshold.
+    cup_b.init_state.pos = (0.247, -0.049, CUP_SPAWN_Z)
     cup_b.init_state.rot = euler_angles_to_quat(np.array([0, 90, 0]), degrees=True)
 
     cup_c = _cup_base.replace()

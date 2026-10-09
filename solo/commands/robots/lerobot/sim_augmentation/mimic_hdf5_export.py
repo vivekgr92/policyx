@@ -138,8 +138,21 @@ def _compute_grasped_signal(
     object_poses: dict[str, np.ndarray],
     gripper_action: np.ndarray,
     grasp_threshold_pct: float,
-) -> tuple[np.ndarray, Optional[str]]:
-    """Returns (signal [T,1] float32, active_object_name).
+) -> tuple[np.ndarray, Optional[str], tuple[int, int]]:
+    """Returns (signal [T,1] float32, active_object_name, trim_window).
+
+    trim_window = (start, end) frame indices bounding JUST the active
+    object's own pick-place cycle -- real root cause found via live Isaac
+    Mimic testing (confirmed by distance/jaw-angle instrumentation during an
+    actual generated trial): exporting the FULL multi-cup episode as a
+    single "grasp cup_b" subtask fed Mimic the whole cup_a->cup_b->cup_c
+    motion arc as if it were all one subtask. The gripper reopening for
+    cup_c (part of the same exported trajectory) looked, to the live
+    success check, like the robot releasing cup_b and never regrasping --
+    distance to cup_b stayed 2.7x past the proximity threshold the whole
+    time. Trimming to the window between the end of the PRECEDING grasp
+    segment (or 0) and the start of the FOLLOWING one (or T) isolates just
+    this cup's own approach/grasp/place cycle.
 
     Detects EVERY grasp/release cycle (contiguous closed segment), not just
     the first -- a real recorded dataset (vivekgr92/tags) confirmed, by
@@ -161,7 +174,7 @@ def _compute_grasped_signal(
     T = eef_pose.shape[0]
     is_closed = gripper_action.reshape(-1) < grasp_threshold_pct
     if not is_closed.any():
-        return np.zeros((T, 1), dtype=np.float32), None
+        return np.zeros((T, 1), dtype=np.float32), None, (0, T)
 
     # Contiguous closed segments = individual grasp events.
     edges = np.diff(is_closed.astype(np.int8))
@@ -199,7 +212,15 @@ def _compute_grasped_signal(
     else:
         active_name = segment_objects[0] if segment_objects else None
 
-    return signal, active_name
+    # Isolate the active object's OWN pick-place cycle: from the end of the
+    # preceding grasp segment (or episode start) to the start of the
+    # following one (or episode end). Picks the first matching segment if
+    # the majority object was grasped more than once.
+    active_idx = segment_objects.index(active_name)
+    trim_start = segments[active_idx - 1][1] if active_idx > 0 else 0
+    trim_end = segments[active_idx + 1][0] if active_idx + 1 < len(segments) else T
+
+    return signal, active_name, (trim_start, trim_end)
 
 
 def export_episode(
@@ -235,7 +256,7 @@ def export_episode(
             )
 
     gripper_action = actions[:, -1:]
-    grasped_signal, active_object = _compute_grasped_signal(
+    grasped_signal, active_object, (trim_start, trim_end) = _compute_grasped_signal(
         eef_pose, object_poses, gripper_action, grasp_threshold_pct
     )
     if active_object is None:
@@ -246,6 +267,19 @@ def export_episode(
             "Check --grasp-threshold-pct and the gripper open/close direction (UNVERIFIED -- see "
             "so101_joint_mapping.py's GRIPPER_PCT_MAPS_TO_LOWER_AT_ZERO) against this dataset."
         )
+    else:
+        typer.echo(
+            f"   trimming episode to frames [{trim_start}:{trim_end}] (of {actions.shape[0]}) -- "
+            f"'{active_object}'s own pick-place cycle, confirmed necessary via live Isaac Mimic "
+            "testing: exporting the full multi-cup episode as one subtask fed Mimic the whole "
+            "motion arc, including releasing this object to grasp the next one."
+        )
+
+    actions = actions[trim_start:trim_end]
+    eef_pose = eef_pose[trim_start:trim_end]
+    target_eef_pose = target_eef_pose[trim_start:trim_end]
+    object_poses = {name: poses[trim_start:trim_end] for name, poses in object_poses.items()}
+    grasped_signal = grasped_signal[trim_start:trim_end]
 
     return {
         "actions": actions,

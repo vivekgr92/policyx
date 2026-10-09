@@ -15,6 +15,22 @@ index 6077709..99e546b 100644
  
  here = os.path.dirname(os.path.abspath(__file__))
  
+diff --git a/source/sim_to_real_so101/mdp/obs.py b/source/sim_to_real_so101/mdp/obs.py
+index 91e9d3e..d5acc74 100644
+--- a/source/sim_to_real_so101/mdp/obs.py
++++ b/source/sim_to_real_so101/mdp/obs.py
+@@ -31,9 +31,9 @@ def ee_frame_state(
+     Return the state of the end effector frame in the robot coordinate system.
+     """
+     robot = env.scene[robot_cfg.name]
+-    robot_root_pos, robot_root_quat = robot.data.root_pos_w, robot.data.root_quat_w
++    robot_root_pos, robot_root_quat = robot.data.root_pos_w.torch, robot.data.root_quat_w.torch
+     ee_frame: FrameTransformer = env.scene[ee_frame_cfg.name]
+-    ee_frame_pos, ee_frame_quat = ee_frame.data.target_pos_w[:, 0, :], ee_frame.data.target_quat_w[:, 0, :]
++    ee_frame_pos, ee_frame_quat = ee_frame.data.target_pos_w.torch[:, 0, :], ee_frame.data.target_quat_w.torch[:, 0, :]
+     ee_frame_pos_robot, ee_frame_quat_robot = math_utils.subtract_frame_transforms(
+         robot_root_pos, robot_root_quat, ee_frame_pos, ee_frame_quat
+     )
 diff --git a/source/sim_to_real_so101/mdp/resets.py b/source/sim_to_real_so101/mdp/resets.py
 index 8257944..9e0cbf7 100644
 --- a/source/sim_to_real_so101/mdp/resets.py

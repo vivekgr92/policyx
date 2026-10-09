@@ -199,7 +199,18 @@ class SO101CupPickPlaceMimicEnvCfg(SO101CupPickPlaceEnvCfg, MimicEnvCfg):
                 selection_strategy_kwargs={"nn_k": 3},
                 action_noise=0.03,
                 num_interpolation_steps=5,
-                num_fixed_steps=0,
+                # Real root cause of persistent 0% success, found via live
+                # distance/jaw-angle instrumentation across 2 debug rounds:
+                # with num_fixed_steps=0 there's no phase after reaching the
+                # interpolated target pose where the REAL recorded action
+                # stream (including the gripper closing) actually replays --
+                # Mimic's interpolation phase keeps the gripper open for
+                # safety the whole approach, so it was fully open exactly at
+                # closest approach (min dist 0.0717, just 1.2cm short of the
+                # 0.06 threshold) and only started closing after the arm had
+                # already retreated. 30 ~= the ~55-frame closed-gripper
+                # window in our trimmed 153-frame source segment.
+                num_fixed_steps=30,
                 apply_noise_during_interpolation=False,
                 description="Grasp and place cup_b",
                 next_subtask_description=None,

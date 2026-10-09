@@ -1,0 +1,22 @@
+# Patch applied on top of isaac-sim/isaac-launchable's isaac-lab/docker-compose.yml
+# by deploy-isaac-launchable.sh. Captures the two real fixes needed to view the
+# stream from a browser that isn't on the VM itself:
+#
+#   - ENV=brev: the web-viewer entrypoint uses this to auto-detect the VM's real
+#     public IP (via icanhazip.com) and bakes it into the frontend as the WebRTC
+#     mediaServer. "localhost" mode hardcodes 127.0.0.1, which only works if the
+#     browser is running on the VM itself. "brev" has nothing else Brev-specific
+#     about it - it's just the IP-detection branch that happens to fit a plain
+#     public-IP VM too.
+#   - FORCE_WSS=false: without this the frontend hardcodes a wss:// (TLS)
+#     signaling connection on port 443, which fails on first load because the
+#     VM's self-signed cert isn't trusted by the browser yet. Plain ws:// on
+#     port 80 (already proxied by nginx) works immediately with no cert dance.
+#
+# Also requires real public ingress on the VM for the actual WebRTC media
+# (UDP/TCP, can't be tunneled over SSH) - see open-firewall.sh.
+services:
+  web-viewer:
+    environment:
+      - ENV=brev
+      - FORCE_WSS=false

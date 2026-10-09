@@ -21,7 +21,19 @@ from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils import configclass
-from isaacsim.core.utils.rotations import euler_angles_to_quat
+from isaacsim.core.experimental.utils.transform import euler_angles_to_quaternion
+
+# isaacsim.core.utils (used by this file in the original isaaclab 2.3.1 /
+# isaacsim 4.x era) was removed from the default extension set in Isaac Sim
+# 6.0.1 - confirmed via direct import testing on a real isaaclab
+# 3.0.0-beta2-post1 install, even with a fully launched AppLauncher app, not
+# just a cold import. isaacsim.core.experimental.utils.transform's
+# euler_angles_to_quaternion is the current replacement; same (w, x, y, z)
+# convention, but returns a Warp array instead of a bare numpy array.
+
+
+def euler_angles_to_quat(euler_angles, degrees=False):
+    return euler_angles_to_quaternion(euler_angles, degrees=degrees).numpy()
 
 from sim_to_real_so101 import assets
 from sim_to_real_so101.mdp import reset_joints_by_offset, JointPositionActionCfg

@@ -190,3 +190,22 @@ class SO101CupPickPlaceMimicEnvCfg(SO101CupPickPlaceEnvCfg, MimicEnvCfg):
         # the actual fix (my two earlier attempts touched different fields).
         self.sim.render.carb_settings = None
 
+
+# Registered here (not in the upstream sim_to_real_so101/tasks/__init__.py)
+# because, as of isaaclab 3.0.0-beta2-post1, isaaclab_tasks.utils.import_packages
+# only auto-imports __init__.py packages, not bare .py modules -- so a
+# gym.register() living in a plain env_cfg.py file like this one is never
+# auto-discovered. Confirmed by direct testing: import_packages walks right
+# past this file. An external caller must explicitly import this module
+# (see register_cup_task.py-style callback) to trigger this registration.
+import gymnasium as gym  # noqa: E402
+
+gym.register(
+    id="Lerobot-So101-Cup-PickPlace-Mimic",
+    entry_point="sim_to_real_so101.tasks.cup_pickplace_mimic_env:SO101CupPickPlaceMimicEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}:SO101CupPickPlaceMimicEnvCfg",
+    },
+)
+

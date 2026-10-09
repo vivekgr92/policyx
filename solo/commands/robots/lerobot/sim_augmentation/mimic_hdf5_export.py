@@ -12,9 +12,18 @@ issue documented in vlm_judge_playground.py):
 Produces the `obs/datagen_info/*` annotations isaaclab_mimic's
 DataGenInfoPool reads via a flat static HDF5 read -- confirmed against the
 real v2.3.1 source (datagen_info_pool.py's `_add_episode`), NOT assumed:
-    obs/datagen_info/eef_pose                      [T,4,4]
+    obs/datagen_info/eef_pose/<eef_name>           [T,4,4]  (one group per robot eef -- CHANGED
+                                                              from a flat [T,4,4] dataset: confirmed
+                                                              via live isaaclab 3.0.0-beta2 testing
+                                                              that DataGenerator.select_source_demo
+                                                              indexes DatagenInfo.eef_pose by eef_name,
+                                                              same as object_poses; the 2.3.1-era flat
+                                                              layout this originally matched no longer
+                                                              works. <eef_name> must match the key used
+                                                              in the env cfg's subtask_configs dict
+                                                              (e.g. "robot").)
     obs/datagen_info/object_pose/<name>            [T,4,4]  (one group per tracked object)
-    obs/datagen_info/target_eef_pose               [T,4,4]
+    obs/datagen_info/target_eef_pose/<eef_name>    [T,4,4]  (same per-eef-name grouping as eef_pose)
     obs/datagen_info/subtask_term_signals/<name>   [T,1]    (one per NON-FINAL subtask only --
                                                               the last subtask needs no signal,
                                                               its end is just episode end)
@@ -268,8 +277,12 @@ def write_hdf5(output_path: Path, env_name: str, episodes_data: list[dict]) -> N
 
             obs_grp = ep_grp.create_group("obs")
             dg_grp = obs_grp.create_group("datagen_info")
-            dg_grp.create_dataset("eef_pose", data=ep["eef_pose"], compression="gzip")
-            dg_grp.create_dataset("target_eef_pose", data=ep["target_eef_pose"], compression="gzip")
+            # Grouped per eef_name ("robot", matching the env cfg's subtask_configs
+            # key) rather than a flat dataset -- see module docstring for why.
+            eef_pose_grp = dg_grp.create_group("eef_pose")
+            eef_pose_grp.create_dataset("robot", data=ep["eef_pose"], compression="gzip")
+            target_eef_pose_grp = dg_grp.create_group("target_eef_pose")
+            target_eef_pose_grp.create_dataset("robot", data=ep["target_eef_pose"], compression="gzip")
 
             obj_grp = dg_grp.create_group("object_pose")
             for name, poses in ep["object_pose"].items():

@@ -55,6 +55,33 @@ _cup_base = RigidObjectCfg(
 
 CUP_SPAWN_Z = 0.05
 
+# Real AprilTag-measured cup_b position from the actual test source episode
+# (vivekgr92/tags ep 0, mean obs/datagen_info/object_pose/cup_b): (0.247,
+# -0.049) in the ROBOT-BASE frame (apriltag_pose.py's hand-eye-calibrated
+# convention, same as so101_fk.py's FK frame). THE REAL BUG (found by
+# diagnosing the generated dataset's systematic ~0.36m "wrong target" error):
+# RigidObjectCfg.InitialStateCfg.pos is a WORLD/env-frame coordinate, not
+# robot-relative, and the sim robot is spawned rotated 90deg yaw in the world
+# (so101.py) -- confirmed via quaternion math on recorded root_pose data.
+# get_object_poses() (cup_pickplace_mimic_env.py) strips that same 90deg
+# rotation via subtract_frame_transforms() when converting back to robot-
+# relative frame for Mimic's retargeting math, so writing the raw AprilTag
+# value directly as init_state.pos (as before) fed Mimic a target rotated
+# 90deg from the real one -- a 0.356m error, matching the diagnosed ~0.36m
+# almost exactly. Fix: pre-rotate the real measured value by the robot's own
+# spawn yaw here (module scope, NOT inside the @configclass body -- configclass
+# treats every class-body name as a scene-entity field, so plain float/tuple
+# helper variables there raise "Unknown asset config type") so that
+# get_object_poses()'s inverse rotation recovers the real value exactly.
+_CUP_B_REAL_ROBOT_BASE_POS = (0.247, -0.049)
+_ROBOT_SPAWN_YAW_RAD = np.deg2rad(90.0)  # so101.py's robot root spawn rotation
+_cos_yaw, _sin_yaw = np.cos(_ROBOT_SPAWN_YAW_RAD), np.sin(_ROBOT_SPAWN_YAW_RAD)
+CUP_B_SPAWN_POS = (
+    float(_cos_yaw * _CUP_B_REAL_ROBOT_BASE_POS[0] - _sin_yaw * _CUP_B_REAL_ROBOT_BASE_POS[1]),
+    float(_sin_yaw * _CUP_B_REAL_ROBOT_BASE_POS[0] + _cos_yaw * _CUP_B_REAL_ROBOT_BASE_POS[1]),
+    CUP_SPAWN_Z,
+)
+
 
 @configclass
 class SO101CupPickPlaceSceneCfg(SO101TaskSceneCfg):
@@ -65,12 +92,7 @@ class SO101CupPickPlaceSceneCfg(SO101TaskSceneCfg):
 
     cup_b = _cup_base.replace()
     cup_b.prim_path = "{ENV_REGEX_NS}/Cup_B"
-    # Matched to the real AprilTag-measured cup_b position from the actual
-    # test source episode (vivekgr92/tags ep 0, mean obs/datagen_info/
-    # object_pose/cup_b), not the original placeholder (0.22, 0.0, Z) --
-    # confirmed via live testing that the ~5.6cm gap between the two was
-    # sitting right at the edge of cup_grasped's 0.06m proximity threshold.
-    cup_b.init_state.pos = (0.247, -0.049, CUP_SPAWN_Z)
+    cup_b.init_state.pos = CUP_B_SPAWN_POS
     cup_b.init_state.rot = euler_angles_to_quat(np.array([0, 90, 0]), degrees=True)
 
     cup_c = _cup_base.replace()

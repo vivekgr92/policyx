@@ -58,6 +58,13 @@ git -C "${REPO_DIR}" lfs pull
 echo "==> Applying Isaac Sim 6.0.1 compat patch..."
 git -C "${REPO_DIR}" apply "${SCRIPT_DIR}/sim-to-real-so101-workshop-isaac-sim-6-compat.patch"
 
+echo "==> Fixing the robot's visual mesh (real authoring defect in the"
+echo "    upstream USD - see fix-robot-visual-mesh.py's header for details)..."
+cp "${SCRIPT_DIR}/fix-robot-visual-mesh.py" /workspace/isaaclab/fix-robot-visual-mesh.py
+(cd /workspace/isaaclab && ./isaaclab.sh -p fix-robot-visual-mesh.py)
+sed -i 's|usd_path=f"{here}/usd/SO-ARM101-USD.usd"|usd_path=f"{here}/usd/SO-ARM101-USD-visual-fix.usd"|' \
+  "${REPO_DIR}/source/sim_to_real_so101/assets/so101.py"
+
 echo "==> Dropping in the cup pick-place env files..."
 cp "${SOLO_CLI_ENVS_DIR}/cup_pickplace_mimic_env.py" "${REPO_DIR}/source/sim_to_real_so101/tasks/"
 cp "${SOLO_CLI_ENVS_DIR}/cup_pickplace_mimic_env_cfg.py" "${REPO_DIR}/source/sim_to_real_so101/tasks/"

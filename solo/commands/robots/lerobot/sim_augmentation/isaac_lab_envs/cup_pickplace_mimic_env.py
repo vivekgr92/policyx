@@ -72,8 +72,27 @@ class SO101CupPickPlaceMimicEnv(ManagerBasedRLMimicEnv):
         }
 
     def actions_to_gripper_actions(self, actions: torch.Tensor) -> dict[str, torch.Tensor]:
-        # last dim is the separate gripper_action term (see env cfg)
-        return {"robot": actions[:, -1:]}
+        # Real root cause of a confirmed live bug, found by tracing a stuck
+        # jaw_pos=1.7453 (the Jaw joint's max-open radian limit) through the
+        # whole Mimic pipeline: the recorded gripper value here is raw
+        # percent-of-travel (0-100, LeRobot RANGE_0_100 convention), but the
+        # gripper_action term downstream (cup_pickplace_mimic_env_cfg.py,
+        # JointPositionActionCfg(scale=1, use_default_offset=False)) expects
+        # a direct radian joint-position target. Without conversion, a
+        # recorded "24.08" (meant as 24.08%) got sent as 24.08 RADIANS --
+        # ~14x past the real joint limit -- so physics silently clamped it
+        # to the max every time, regardless of the true recorded value.
+        # Converts here, the single real entry point where raw HDF5 percent
+        # data enters Mimic's DatagenInfo pipeline, using the exact same
+        # affine map so101_joint_mapping.py's JointMapping.to_sim_radians()
+        # already defines for this joint (inlined, not imported, since
+        # solo-cli's own package isn't necessarily on PYTHONPATH inside the
+        # Isaac Lab venv this file actually runs in).
+        gripper_lo_rad, gripper_hi_rad = -0.174533, 1.74533  # so101_joint_mapping.py's real nominal_limit_rad
+        gripper_pct = actions[:, -1:] / 100.0
+        # GRIPPER_PCT_MAPS_TO_LOWER_AT_ZERO = True in so101_joint_mapping.py
+        gripper_rad = gripper_lo_rad + gripper_pct * (gripper_hi_rad - gripper_lo_rad)
+        return {"robot": gripper_rad}
 
     def target_eef_pose_to_action(
         self,

@@ -1,0 +1,61 @@
+<mujoco model="pick_place">
+  <!-- User-authored scene (NOT from Menagerie — see SOURCE.md). Sits next
+       to scene.xml/so101.xml so relative paths (includes, meshdir) resolve
+       identically to the vendored scenes. -->
+  <include file="so101.xml" />
+
+  <visual>
+    <headlight diffuse="0.6 0.6 0.6" ambient="0.3 0.3 0.3" specular="0 0 0" />
+    <rgba haze="0.15 0.25 0.35 1" />
+    <global azimuth="160" elevation="-20" />
+  </visual>
+
+  <asset>
+    <texture type="skybox" builtin="gradient" rgb1="0.3 0.5 0.7" rgb2="0 0 0"
+             width="512" height="3072" />
+    <texture type="2d" name="groundplane" builtin="checker" mark="edge"
+             rgb1="0.2 0.3 0.4" rgb2="0.1 0.2 0.3" markrgb="0.8 0.8 0.8"
+             width="300" height="300" />
+    <material name="groundplane" texture="groundplane" texuniform="true"
+              texrepeat="5 5" reflectance="0.2" />
+  </asset>
+
+  <worldbody>
+    <light pos="0 0 3.5" dir="0 0 -1" directional="true" />
+    <geom name="floor" size="0 0 0.05" pos="0 0 0" type="plane"
+          material="groundplane" />
+
+    <!-- Target container: static, open-top. Inner footprint ~8x8 cm,
+         walls 5 mm thick, 3 cm tall. Placed to the +y side of arm base. -->
+    <body name="target_box" pos="0.22 0.10 0">
+      <geom name="target_floor" type="box" pos="0 0 0.005"
+            size="0.05 0.05 0.005"
+            rgba="0.15 0.35 0.65 1" contype="1" conaffinity="1"/>
+      <geom name="target_wall_px" type="box" pos="0.045 0 0.02"
+            size="0.005 0.05 0.015"
+            rgba="0.15 0.35 0.65 1" contype="1" conaffinity="1"/>
+      <geom name="target_wall_nx" type="box" pos="-0.045 0 0.02"
+            size="0.005 0.05 0.015"
+            rgba="0.15 0.35 0.65 1" contype="1" conaffinity="1"/>
+      <geom name="target_wall_py" type="box" pos="0 0.045 0.02"
+            size="0.05 0.005 0.015"
+            rgba="0.15 0.35 0.65 1" contype="1" conaffinity="1"/>
+      <geom name="target_wall_ny" type="box" pos="0 -0.045 0.02"
+            size="0.05 0.005 0.015"
+            rgba="0.15 0.35 0.65 1" contype="1" conaffinity="1"/>
+    </body>
+
+    <!-- Graspable cube: free joint so gravity and the gripper move it.
+         Collision config mirrors Menagerie's scene_box.xml for stable
+         pinch-grip: contype=2 (cube-only), solref fast, tuned friction. -->
+    <body name="cube" pos="0.22 -0.08 0.015">
+      <freejoint name="cube_free"/>
+      <geom name="cube" type="box" size="0.015 0.015 0.015"
+            mass="0.02" condim="3"
+            friction="1 0.03 0.003"
+            rgba="0.85 0.15 0.15 1"
+            contype="2" conaffinity="1"
+            solref="0.01 1"/>
+    </body>
+  </worldbody>
+</mujoco>

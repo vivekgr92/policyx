@@ -1,0 +1,62 @@
+<mujoco model="cup_pickplace">
+  <!-- Real, not-NVIDIA 3-cup pick-place scene for the SO-101 MuJoCo pivot.
+       Cup positions are the REAL AprilTag-measured values from the actual
+       recorded demo (so101_cup_pickplace.hdf5, obs/datagen_info/object_pose),
+       in the robot's base frame -- used directly with NO rotation, because
+       this model's base body sits at pos="0 0 0" quat="1 0 0 0" (confirmed
+       via cross-validation against so101_fk.py's ikpy-URDF FK: the
+       gripperframe site lands within ~2cm of our own FK output for the same
+       recorded joint angles, with the remaining gap attributable to a minor
+       site-placement difference, not a frame/axis bug). This is the thing
+       that silently broke in the Isaac Lab port all session (an opaque
+       scene-level spawn rotation nobody accounted for) -- here we own the
+       scene definition, so there is no such hidden transform. -->
+  <include file="so101.xml" />
+
+  <visual>
+    <headlight diffuse="0.6 0.6 0.6" ambient="0.3 0.3 0.3" specular="0 0 0" />
+    <rgba haze="0.15 0.25 0.35 1" />
+    <global azimuth="160" elevation="-20" />
+  </visual>
+
+  <asset>
+    <texture type="skybox" builtin="gradient" rgb1="0.3 0.5 0.7" rgb2="0 0 0"
+             width="512" height="3072" />
+    <texture type="2d" name="groundplane" builtin="checker" mark="edge"
+             rgb1="0.2 0.3 0.4" rgb2="0.1 0.2 0.3" markrgb="0.8 0.8 0.8"
+             width="300" height="300" />
+    <material name="groundplane" texture="groundplane" texuniform="true"
+              texrepeat="5 5" reflectance="0.2" />
+  </asset>
+
+  <worldbody>
+    <light pos="0 0 3.5" dir="0 0 -1" directional="true" />
+    <geom name="floor" size="0 0 0.05" pos="0 0 0" type="plane"
+          material="groundplane" />
+
+    <!-- Real measured cup_a position (0.2208, 0.0752, 0.0307) -->
+    <body name="cup_a" pos="0.2208 0.0752 0.0307">
+      <freejoint name="cup_a_free"/>
+      <geom name="cup_a" type="cylinder" size="0.013 0.02"
+            mass="0.03" condim="3" friction="1 0.03 0.003"
+            rgba="0.2 0.6 0.9 1" contype="2" conaffinity="1" solref="0.01 1"/>
+    </body>
+
+    <!-- Real measured cup_b position (0.2121, -0.0488, 0.0485) -- the
+         Mimic subtask's actual object_ref target all session. -->
+    <body name="cup_b" pos="0.2121 -0.0488 0.0485">
+      <freejoint name="cup_b_free"/>
+      <geom name="cup_b" type="cylinder" size="0.013 0.02"
+            mass="0.03" condim="3" friction="1 0.03 0.003"
+            rgba="0.9 0.3 0.2 1" contype="2" conaffinity="1" solref="0.01 1"/>
+    </body>
+
+    <!-- Real measured cup_c position (0.1783, -0.1657, 0.0447) -->
+    <body name="cup_c" pos="0.1783 -0.1657 0.0447">
+      <freejoint name="cup_c_free"/>
+      <geom name="cup_c" type="cylinder" size="0.013 0.02"
+            mass="0.03" condim="3" friction="1 0.03 0.003"
+            rgba="0.3 0.8 0.3 1" contype="2" conaffinity="1" solref="0.01 1"/>
+    </body>
+  </worldbody>
+</mujoco>
